@@ -1,0 +1,26 @@
+#!/bin/sh
+d="$1"
+if [[ -z "$d" ]]; then
+  echo "Usage: cidr-get <RemotePath>"
+  exit 1
+fi
+
+#export ASPERA_SCP_PASS="Derecho20120705Hurricane"
+export ASPERA_SCP_PASS="Cluster20130923Shipment"
+#echo "ascp command:"
+#echo "ascp -Q -l 50m -k 3 salzberg-cidr@162.129.219.240:"'$d'""
+#ascp -Q -l 50m -k 3 salzberg-cidr@162.129.219.240:"$d" .
+#echo "ascp command:"
+#echo "ascp -Q -l 100m -k 2 mendel-igm@10.99.32.2:$d ."
+dir=~/.aspera/connect/bin
+#tgt=mendel-igm@162.129.219.240:"$d"
+tgt=cidr-margolis@162.129.219.240:"$d"
+until $dir/ascp -Q -l 80m -k 3 $tgt .
+do
+ echo "....Trying again..."
+done
+#ascp -Q -l 100m -k 2 valle-cidr@162.129.219.240:"$d" .
+#echo "ascp command:"
+#echo "ascp -Q -l 100m -k 3 valle-cidr@10.99.32.2:'$d' ."
+#ascp -Q -l 100m -k 3 valle-cidr@10.99.32.2:"'$d'" .
+

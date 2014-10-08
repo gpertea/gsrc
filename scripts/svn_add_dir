@@ -1,0 +1,15 @@
+#!/bin/sh
+if [[ -z "$1" || "$1" == "-h" || "$1" == "--help" ]]; then
+  echo "Add the current directory to svn:\n $SVN"
+  echo -e "Usage:\n svn_add_dir ."
+  echo "(yes, the period is mandatory)"
+  exit 1
+fi
+
+cdir=${PWD##*/}
+echo "running: svn mkdir $SVN/$cdir"
+svn mkdir $SVN/$cdir
+echo "running: svn co $SVN/$cdir ."
+svn co $SVN/$cdir .
+echo "Now use 'svn add ...' to add the files you want"
+echo " then 'svn commit' when ready."

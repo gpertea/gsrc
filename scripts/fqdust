@@ -1,0 +1,26 @@
+#!/usr/bin/perl
+#simple dust filter for short reads:
+# if more than 50% of the sequence is masked, don't print the read
+use strict;
+while (<>) {
+ if (m/^@(\S+)/) {
+   my $seqname=$1;
+   my $seq=<>;
+   $seq=~tr/\n\r//d;
+   my $qh=<>;
+   #chomp($qh);
+   $qh=~tr/\n\r//d;
+   die("Error: 3rd line of $seqname must start with '+' !\n")  
+      unless ($qh eq '+') || ($qh eq '+'.$seqname);
+   my $quals=<>;
+   my $mseq=$seq;
+   $mseq =~ s/((\w+?)\2{5,})/'N' x length $1/oeg;
+   my $masked=($mseq=~tr/N//);
+   if ($masked<(length($seq)>>1)) {
+     print "\@$seqname\n$seq\n+\n$quals";
+     }
+    #else {
+    # print STDERR "Discarding: $seq\n";
+    # } 
+   }
+}

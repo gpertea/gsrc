@@ -1,0 +1,158 @@
+#!/usr/bin/perl
+use strict;
+use File::Spec;
+use Getopt::Std;
+use FindBin;use lib $FindBin::Bin;
+
+my $usage = q/General usage:
+  star <command> [options] <command_parameters..>
+
+Available commands:
+ 1) index
+  star index [-p <#cpus>] <genome_index_dir> genome.fa [genome2.fa...]
+
+ 2) map
+  star map [-p <#cpus>] [-g <maxgap>] [-R][-S][-N][-m <email>] \
+           <genome_index_dir> <out_dir> reads.fq [reads_2.fq]
+   Options:
+    -g : when aligning paired reads, inner mate distance is at most <maxgap>
+    -R : enable RNA-Seq mapping (default: genomic mapping)
+    -S : map paired reads independently (using 2 STAR processes)
+    -N : rename reads as numeric IDs
+    -m : send e-mail notification to <email> when STAR finishes
+
+Common options:
+    -p : use #cpus for mapping (default: 1)
+/;
+umask 0002;
+my $mode=shift(@ARGV);
+my $mapping=0;
+my ($genomedir, $numcpus);
+my $optcpus='';
+if ($mode eq 'index') {
+ #just build the index and exit
+ my $exitcode=0;
+ #just build the index here..
+ getopts('p:') || die($usage."\n");
+ $numcpus = $Getopt::Std::opt_p;
+ $genomedir=shift(@ARGV)
+   || die($usage."Error: output genome directory expected.\n");
+ my @gfiles=@ARGV;
+ die($usage."Error: input genome files expected.\n") unless @gfiles>0;
+ if (-d $genomedir) {
+  system("/bin/rm -rf '$genomedir'/*")
+     && die("Error encountered while removing $genomedir/*\n");
+ }
+ else {
+  mkdir($genomedir) || die("Error creating dir $genomedir $!\n");
+ }
+ 
+ $optcpus=' --runThreadN '.$numcpus if ($numcpus>1);
+ my $mode="STARg --runMode genomeGenerate --genomeDir $genomedir".
+      $optcpus.' --genomeFastaFiles '.join(' ', @gfiles);
+ $exitcode=system($mode);
+ exit($exitcode);
+}
+if ($mode ne 'map') {
+ die($usage."\n");
+}
+# mapping mode:
+$mapping=1;
+getopts('RSNm:p:g:') || die($usage."\n");
+#my $outfile=$Getopt::Std::opt_o;
+$numcpus = $Getopt::Std::opt_p;
+my $RNAsearch = $Getopt::Std::opt_R;
+my $renameReads = $Getopt::Std::opt_N;
+my $pairedSingle = $Getopt::Std::opt_S;
+my $maxgap = $Getopt::Std::opt_g;
+my $email = $Getopt::Std::opt_m;
+$genomedir=shift(@ARGV) || 
+   die($usage."Error: input genome dir expected.\n");
+die($usage."Error: cannot find input genome dir $genomedir.\n")
+  unless (-d $genomedir);
+$genomedir = File::Spec->rel2abs($genomedir);
+my $outdir=shift(@ARGV) || die($usage."Error: output dir not provided.\n");
+if (-d $outdir) {
+  die("Error: output directory $outdir already exists. Remove or rename it and try again.\n");
+}
+my @rfiles=@ARGV;
+die("Error: no valid read files given!\n") if @rfiles==0 || !-f $rfiles[0];
+die("Error: more than 2 read files given!\n") if (@rfiles>2);
+mkdir($outdir) || die("Error creating directory $outdir ($!)\n");
+if ($pairedSingle && @rfiles==2) {
+ mkdir($outdir.'/_1') || die("Error creating dir $outdir/_1 $!\n");
+ mkdir($outdir.'/_2') || die("Error creating dir $outdir/_2 $!\n");
+}
+
+#if ($outfile) {
+#  open(OUTF, '>'.$outfile) || die("Error creating output file $outfile\n");
+#  select(OUTF);
+#  }
+# --
+if (@rfiles==2 && $pairedSingle && $numcpus>1) {
+ $numcpus>>=1;
+}
+foreach (@rfiles) {
+  $_ = File::Spec->rel2abs($_);
+}
+$optcpus=' --runThreadN '.$numcpus if ($numcpus>1);
+my $optrename='';
+$optrename=' --outSAMreadID Number' if $renameReads;
+my $optrna = $RNAsearch ? '' : ' --alignIntronMax 1 --alignIntronMin 2';
+my $optinsgap = $maxgap ? ' --alignMatesGapMax '.$maxgap : '' ;
+my $star_options="--genomeDir $genomedir --genomeLoad LoadAndKeep".
+ $optcpus.$optrna.$optrename.$optinsgap.
+ ' --outSAMprimaryFlag AllBestScore  --outSAMorder PairedKeepInputOrder'.
+ ' --outSAMattributes All --outFilterScoreMinOverLread 0.5 --outFilterMatchNminOverLread 0.5'.
+ ' --outFilterMismatchNoverLmax 0.08 --outFilterMismatchNmax 50 '.
+ ' --outFilterMultimapNmax 40 --outFilterMultimapScoreRange 2 ';
+my $cmd="$star_options ";
+my @cmds;
+my @dirs;
+if ($pairedSingle && @rfiles==2) {
+  push(@cmds, $cmd.' --readFilesIn '.$rfiles[0], 
+              $cmd.' --readFilesIn '.$rfiles[1]);
+  push(@dirs, $outdir.'/_1', $outdir.'/_2');
+}
+else {
+ push(@cmds, $cmd.' --readFilesIn '.join(' ',@rfiles));
+ push(@dirs, $outdir);
+}
+
+my @pids;
+my $curdir=$ENV{'PWD'};
+my $di=0;
+for my $p (@cmds) {
+  chdir($dirs[$di]) || die("Error chdir to $dirs[$di]\n");
+  my $exec='STARg '.$p;
+  #print STDERR "cmd = $exec\n";
+  $di++;
+  die "Error: could not fork!\n" 
+      unless defined(my $pid = fork);
+  unless ($pid) { #child execs
+      exec($exec);
+      die "Error: STAR exec failed!\n";
+  }
+  push @pids, $pid; #parent stores children's pids
+  chdir($curdir);
+  sleep(30);
+}
+
+#wait for all children to finish
+for my $pid (@pids) {
+    waitpid $pid, 0;
+}
+if ($email) {
+ my $machine=`uname -n`;
+ open(EMAIL, "| /bin/mailx -s 'STAR finished on $machine' '$email'");
+ print EMAIL "STAR finished on $machine in $outdir:\n".join("\n", @cmds)."\n";
+ close(EMAIL);
+}
+# --
+#if ($outfile) {
+# select(STDOUT);
+# close(OUTF);
+# }
+
+#************ Subroutines **************
+

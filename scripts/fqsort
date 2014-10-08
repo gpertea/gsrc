@@ -1,0 +1,13 @@
+#!/bin/sh
+f="$1"
+if [[ -z $f || $f == "-h" ]]; then
+ echo "Usage: fqsort file.fq"
+ echo ".. Will create file: file.namesorted.fq"
+ exit
+ fi
+fext="${f##*.}"
+fn="${f%.*}"
+fsrt="$fn.namesorted.$fext"
+#echo "Output file will be: '$fsrt'"
+paste - - - - < "$f" | sort -k1,1 -t " " | tr "\t" "\n" > "$fsrt"
+echo "Done - created name-sorted file: '$fsrt'"

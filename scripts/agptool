@@ -1,0 +1,284 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+use FindBin;use lib $FindBin::Bin;
+
+my $usage = q/Usage:
+ agptool [-o <output.agp>] [-M] [-c <contig_name>] [-s <output_seq>]\
+    [-S | -n <seq_name>] [-k <ctg_ref.fa.fai>] <input_agp>[.cidx] <srcseq.fasta.fai>
+
+ Outputs the AGP records processed from the input file <input_agp>
+
+
+ Options:
+  -S write separate scaffolds (reset AGP coordinates to 1 for each CONTIG)
+    if input AGP has multiple CONTIG comments
+  -c only build the sequence for the given contig name; 
+    this option requires the <input_agp>
+    parameter to be a cdbfasta index file (.cidx extension)
+  -k check and, if needed, adjust AGP to match the sequence found in <ctg_ref.fa.fai>
+ Scaffold\/pseudomolecule creation (-s):
+ -s builds the FASTA sequence(s) from the AGP file, taking the fragments
+    from the 2nd input file <srcseq.fasta.fai>
+ -n unless -S or -c were given, the name <seq_name> is used in the output 
+    FASTA sequence (default: pseudomolecule);
+
+/;
+umask 0002;
+getopts('Sn:s:o:c:k:') || die($usage."Invalid options!\n");
+my $outfile=$Getopt::Std::opt_o;
+my $outSeq=$Getopt::Std::opt_s;
+#my $mergeAdj=$Getopt::Std::opt_M;
+my $outSeqName=$Getopt::Std::opt_n || 'pseudomolecule';
+my $separateCtgSeqs=$Getopt::Std::opt_S;
+my $selContig=$Getopt::Std::opt_c;
+my $ckfa=$Getopt::Std::opt_k;
+my $ckseq;  #current CONTIG sequence from $ckfa
+my $ckname; #current CONTIG name from $ckfa
+my %gapname;
+@gapname{('clone', 'contig', 'fragment', 'gap')}=();
+if ($outfile) {
+  open(OUTF, '>'.$outfile) || die("Error creating output AGP file $outfile\n");
+  select(OUTF);
+  }
+# --
+my ($agp, $srcfa)=@ARGV;
+die($usage."Error: cannot find input file: $agp\n") unless -f $agp;
+die($usage."Error: cannot find required file $srcfa\n") if $outSeq && !-f $srcfa;
+if ($srcfa) {
+  die("Error: samtools fasta index required (samtools faidx)!\n") 
+    unless (-f $srcfa && $srcfa=~s/\.fai$//);
+}
+if ($ckfa) {
+  die("Error: samtools fasta index $ckfa required (samtools faidx)!\n") 
+    unless (-f $ckfa && $ckfa=~s/\.fai$//);
+}
+if ($selContig) {
+die("Error: for -c option, the AGP file must be indexed with cdbfasta\n") 
+ unless ($agp=~m/\.cidx$/);
+ open(AGP, "cdbyank -a '$selContig' $agp |") 
+    || die("Error at cdbyank from $agp\n");
+}
+else {
+ open(AGP, $agp) || die("Error opening $agp\n");
+}
+my $agpline=1;
+if ($outSeq) {
+ open(SEQOUT, '>'.$outSeq) || die("Error creating $outSeq\n");
+}
+
+my ($outname, $outpos);
+$outpos=1;
+my $hWritten=0; #at least 1 header written?
+# prev/current sequence region (for collapsing contiguous blocks)
+my @pbuf; #   0         1        2      3      4      5       6        7        8
+#           ($pname, $pstart, $pstop, $num, $type, $cname, $cstart, $cstop, $cstrand)
+my $cursrcseq; #current source sequence
+my $cursrc;
+while(<AGP>) {
+  if (m/^#[\> \t]*(CONTIG:)\s*(\S+)/) {
+    my $coutname=$1.$2;
+    flushpbuf();
+    $outname=$coutname;
+    #print STDERR "found contig $outname\n";
+    if ((!$selContig || $outSeqName ne 'pseudomolecule') && !$separateCtgSeqs) {
+      $outname=$outSeqName;
+    }
+    if ($ckfa) {
+       $ckname=$coutname;
+       getFaiSeq(\$ckseq, $ckfa, $ckname);
+    }
+    if ($separateCtgSeqs || !$hWritten) {
+      if ($outSeq) {
+         print SEQOUT "\n" if ($outpos>1 && (($outpos-1) % 72 != 0));
+         print SEQOUT ">$outname\n";
+      }
+      $hWritten=1;
+      $outpos=1;
+      print "#>$outname\n";
+    }
+  next;
+  }
+  next if m/^#/;
+  chomp;
+  my $line=$_;
+  #@cbuf=
+  my ($pname, $pstart, $pstop, $num, $type, $cname, $cstart, $cstop, $cstrand)
+      = split(/\t/);
+  next unless $cstop && $pstart<=$pstop;
+  if ($type eq 'N' && $cname=~m/^\d+$/ ) { # && exists($gaptype{$cstart}) {
+    flushpbuf();
+    next if $outpos==1; #never start a sequence with a gap
+    ##They seem to have skipped these two types of gaps :
+    next if $cstart eq 'contig' || $cstart eq 'clone'; ## ??
+    my $outpos0=$outpos;
+    if ($outSeq) {
+       printSeqGap($outname, \$outpos, $cname);
+    }
+    else { $outpos += $cstop-$cstart+1; }
+    
+    print join("\t", $outname, $outpos0, $outpos-1, 
+           $agpline, $type, $cname, $cstart, $cstop, $cstrand)."\n";
+    $agpline++;
+    next;
+  }
+  die("Unrecognized AGP line (type=$type, $cstart-$cstop, $cstrand):\n$line\n") 
+      unless $type eq 'D' && $cstop>=$cstart && 
+         ( $cstrand eq '+' || $cstrand eq '-');
+  #--------
+  if (@pbuf==0) {
+    @pbuf=($pname, $pstart, $pstop, $num, $type, $cname, $cstart, $cstop, $cstrand);
+  } else {
+    if ($cname ne $pbuf[5] || $cstrand ne $pbuf[8] || 
+         ($cstrand eq '+' && $cstart != $pbuf[7]+1) || 
+         ($cstrand eq '-' && $cstop  != $pbuf[6]-1) ) {
+         flushpbuf();
+         @pbuf=($pname, $pstart, $pstop, $num, $type, $cname, $cstart, $cstop, $cstrand);
+         }
+       else { #merge intervals
+       if ($cstrand eq '-') { $pbuf[6] = $cstart; }
+                       else { $pbuf[7] = $cstop;  }
+       }
+  }
+
+} #while <AGP>
+flushpbuf();
+# --
+close(SEQOUT) if $outSeq;
+if ($outfile) {
+ select(STDOUT);
+ close(OUTF);
+ }
+
+#************ Subroutines **************
+
+sub getFaiSeq {
+ my ($rseq, $sfa, $sname, $start, $stop)=@_;
+ $$rseq='';
+ my $samcmd="samtools faidx $sfa '$sname";
+ if ($start && $stop) { $samcmd.=":$start-$stop'"; }
+ $samcmd.="'";
+ my $err="Error retrieving subseq with samtools!($samcmd |)";
+ open(CSEQ, "$samcmd |") || die("$err\n");
+ while (<CSEQ>) {
+    next if m/^>/;
+    chomp;
+    tr/\t \n\r//d;
+    $$rseq.=$_;
+ }
+ close(CSEQ);
+}
+sub checkSeq {
+  my ($rseq, $seglen, $rstrand)=@_;
+  my $useq=uc($$rseq);
+  my $kseq=uc(substr($ckseq, $outpos-1, $seglen));
+  
+  return 0 if ($kseq ne $useq);
+  #they match - but we have to check the special case of rstop boundary 
+  #if (substr($ckseq, $outpos+$seglen-1, 6)=~m/^[^N]NNNNN$/) {
+  #  $$rstrand='~';
+  #  return 0;
+  #}
+  return 1;
+}
+
+sub flushpbuf {
+  return unless @pbuf>0;
+  my ($pname, $pstart, $pstop, $num, $type, $cname, $cstart, $cstop, $cstrand)=@pbuf;
+  if ($cname ne $cursrc) {
+    getFaiSeq(\$cursrcseq, $srcfa, $cname);
+    $cursrc=$cname;
+  }
+  
+  my $seglen= $cstop-$cstart+1;
+  my $seq=substr($cursrcseq, $cstart-1, $seglen);
+  my $slen=length($seq);
+  die("Error retrieving $cname:$cstart-$cstop (length mismatch $slen vs $seglen!)\n") 
+      unless $slen==$seglen;
+  if ($cstrand eq '-') {
+   $seq=reverseComplement($seq);
+  }
+  
+  my $outpos0=$outpos;
+  if ($ckseq) {
+    my $srcstrand=$cstrand;
+    if (!checkSeq(\$seq, $seglen, \$cstrand)) {
+      my $outpos1=$outpos+$seglen-1;
+      print STDERR "Warning: segment $cname:$cstart-$cstop$cstrand differ from $ckname:$outpos-$outpos1\n";
+      #attempt to fix:
+      if ($cstrand eq '-') {
+        $cstop++;
+        $seglen++;
+      }
+      elsif ($cstrand eq '~') {
+        if ($srcstrand eq '+') {
+           $cstop++;
+           $seglen++;
+        }
+        else {
+          $cstart--;
+          $seglen++;
+        }
+        $cstrand=$srcstrand;
+      }
+      elsif ($cstrand eq '+') {
+        if (substr($seq, 0, 1) eq 'N') {
+          print STDERR "N at begining..\n";
+          $cstart++;
+          $seglen--;
+        }
+        else {
+         $cstart--;
+         $seglen++;
+        }
+      }
+      $seq=substr($cursrcseq, $cstart-1, $seglen);
+      $slen=length($seq);
+      $seq=reverseComplement($seq) if ($cstrand eq '-');
+      if (!checkSeq(\$seq, $seglen)) {
+         close(SEQOUT);
+         die("Error: couldn't fix it..\n");
+      }
+    }
+  }
+  if ($outSeq) {
+      printSeq($outname, \$outpos, \$seq);
+    }
+  else { $outpos += $seglen; }
+
+  print join("\t", $outname, $outpos0, $outpos-1, 
+         $agpline, $type, $cname, $cstart, $cstop, $cstrand)."\n";
+  $agpline++;
+  @pbuf=();
+}
+
+sub reverseComplement {
+  my $s=reverse($_[0]);
+  $s =~ tr/AaCcTtGgUuMmRrWwSsYyKkVvHhDdBb/TtGgAaCcAaKkYyWwSsRrMmBbDdHhVv/;
+  return $s;
+ }
+
+sub printSeqGap {
+ my ($name, $rp, $len)=@_;
+ my $seq='N'x $len;
+ printSeq($name, $rp, \$seq);
+}
+
+sub printSeq {
+ my ($name, $rp, $rseq)=@_;
+ #length of  FASTA line: 72
+ my $rest=($$rp-1) % 72;
+ my $seqlen=length($$rseq);
+ my $sp=0;
+ my $sleft=$seqlen;
+ my $plen = 72 - $rest; 
+ while ($sleft>0) {
+  $plen=$sleft if ($plen>$sleft);
+  print SEQOUT substr($$rseq, $sp, $plen);
+  $sleft -= $plen;
+  $sp += $plen;
+  $$rp += $plen;
+  print SEQOUT "\n" if (($$rp-1) % 72 == 0);
+  $plen=72;
+ }
+}

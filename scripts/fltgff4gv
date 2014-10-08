@@ -1,0 +1,191 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+
+my $usage = q/Usage:
+ fltgff4gv [-t <outtrackname>] [-o <outgff>] [-i <max_intron>] [-b <out_bookmarks>]
+           [-I] <gmap_or_pmap_gff3..>
+
+ Use the -I option to preserve the full original IDs found in 
+ the input gff stream.
+ 
+/;
+my %gdup; #prevents the duplicate mappings in the input..
+umask 0002;
+getopts('i:It:o:b:') || die($usage."\n");
+my $track=$Getopt::Std::opt_t;
+my $fullid=$Getopt::Std::opt_I;
+my $bfile=$Getopt::Std::opt_b;
+my $maxintron=$Getopt::Std::opt_i || 320000;
+if ($ARGV[0] && (-s $ARGV[0] < 60)) {
+  exit 0;
+  }
+if ($bfile) {
+ open(BFILE, '>'.$bfile) || die ("Error creating bookmark file $bfile!\n");
+ }
+
+my $outfile=$Getopt::Std::opt_o;
+if ($outfile) {
+ open(OUTFILE, '>'.$outfile) || die ("Error creating file $outfile!\n");
+ select(OUTFILE);
+ }
+
+my $skiprec=0;
+my $parentID='';
+my @mbuf; #buffer mRNA lines so we can filter out some
+my @mbex; #buffered mRNA exons
+while (<>) {
+ next if m/^\s*#/;
+ chomp;
+ my ($chr, $tr, $ftype, $fstart, $fend, $fscore, 
+      $fstrand, $frame, $ndata)=split(/\t/);
+ $tr=$track if $track;
+ if ($ftype eq 'mRNA') {
+   flushmbuf();
+   my ($info)=($ndata=~m/Info="([^"]+)/i);
+   unless ($info) {
+     ($info)=($ndata=~m/TopHit="([^"]+)/i);
+     unless ($info) {
+       ($info)=($ndata=~m/Descr="([^"]+)/i);
+       }
+     if ($info) {
+       my @nri=split(/\x01/, $info);
+       $info=$nri[0] if (@nri>1);
+       }
+     }
+   my ($cov)=($ndata=~m/Cov=([\d\.]+)/i);
+   my ($pi)=($ndata=~m/Identity=([\d\.]+)/i);
+   my ($id)=($ndata=~m/ID=([^;]+)/);   
+   my ($gffname)=($ndata=~m/Name=([^;]+)/);
+   my ($gid, $xid, $name);
+   if (m/GeneId=([\w\.\-]+)/) {
+     $gid=$1;
+     }
+    elsif ($tr=~/jigsaw/ && $id ne $gffname) {
+     $gid=$gffname;
+     }
+   if ($fullid) {
+     $xid=$id;
+     $name=$id;
+     #$info=~s/^\w+\|(\w+)/$1/;
+     $info=~s/gid\://;
+     $info=~s/CDS:\d+\-\d+\s*//;
+     }
+   else {
+    if ($id=~m/^UP/) {
+      if ($id=~m/\|gid\|([\w\-]+)/) {
+        $gid=$1;
+        }
+       else { ($gid)=($id=~m/^UP\w*\|(\w+)/) } 
+      $info=~s/^UniRef\w+\s*//;
+      }
+     else {
+      if ($info=~s/gid:(\S+)\s*//) {
+        $gid=$1;
+        }
+      $info=~s/CDS:\d+\-\d+\s*//;
+      }
+    my ($suffixnum)=($id=~m/\.([pbmrnag]*\d+)$/);
+    my ($num)=($suffixnum=~m/(\d+)$/);
+    my ($suffix)=($suffixnum=~m/^([^\d]+)/);
+    #$suffix='m' unless $suffix;
+    $suffix='m';
+    $num=1 unless $num;
+    ($xid)=($id=~m/^\w+\|([\w]+)/);
+    if ($xid) {
+       $xid=$tr.'|'.$xid.'.'.$suffix.$num;
+       }
+      else { #jigsaw, or anything simple
+       #$xid=$tr.'|'.$id;
+       $xid=$id;
+       }
+   $name=$gid || $xid;
+   }
+   
+   #skip duplicates: same ID, track and same start-end coords
+   $skiprec = ($gdup{"$xid.$tr.$fstart.$fend"}++);
+   # $gdup{"$xid.$fstart.$fend"}++;
+   if ($skiprec) {
+     #print "skipping record $xid.$tr.$fstart.$fend\n";
+     $parentID='';
+     next;
+     }
+   my $xinfo;
+   $xinfo='cov:'.$cov.'%' if $cov;
+   $xinfo.=', ident:'.$pi.'%' if $pi;
+   $xinfo=~s/^\, //;
+   $info.=' ('.$xinfo.')' if $xinfo;
+   if ($tr =~ m/jigsaw/i) {     
+      $xid.='|'.$gid if $gid;
+      $ndata='ID='.$xid.';Name='.$name.';info="'.$info.'"';
+      }
+     else {
+      my $s=(index(uc($info), uc($name))>=0)? $info : $name.' '.$info;
+      $ndata='ID='.$xid.';Name='.$name.';info="'.$s.'"';
+      }
+   $parentID=$xid;
+   if ($bfile) {
+     my $bid=$xid;
+     $bid.="|$gid" if $gid && $xid!~m/\Q|$gid/;
+     print BFILE join("\t",$bid,$fstart)."\n";
+     }
+   } #mRNA line processing until here
+  elsif ($ftype eq 'exon' || $ftype eq 'CDS') {
+   next if $skiprec;
+   next unless $parentID;
+   # my ($pid)=($ndata=~m/Parent=([^;]+)/);
+   # my $pxid;
+   #if ($fullid) {
+   #  $pxid=$pid;
+   #  }
+   # else {
+   #  ($pxid)=($pid=~m/^\w+\|([\w]+)/);
+   #  if ($pxid) {
+   #    my ($pnum)=($pid=~m/\.mrna(\d+)$/);
+   #    $pxid.='.m'.$pnum;
+   #    }
+   #   else { $pxid=$pid; } 
+   #   $ndata='Parent='.$pxid;     
+   #  }
+   $ndata='Parent='.$parentID;
+   push(@mbex, ($fend<$fstart) ? [ $fend, $fstart ] : [$fstart, $fend] );
+   }
+  else  { #next; keep any unrecognized features/markers (e.g. seqgap)
+    flushmbuf();
+    print join("\t",$chr, $tr, $ftype, $fstart, $fend, $fscore, 
+       $fstrand, $frame, $ndata)."\n";
+    next;
+    }
+ # mRNA, exon/CDS go through here:
+ push(@mbuf, join("\t",$chr, $tr, $ftype, $fstart, $fend, $fscore, 
+       $fstrand, $frame, $ndata));
+}
+
+flushmbuf();
+
+close(BFILE) if $bfile;
+if ($outfile) {
+ select STDOUT;
+ close(OUTFILE);
+ }
+
+sub flushmbuf {
+ return unless @mbuf>0 && @mbex>0;
+ if ($mbuf[0]=~m/\tjigsaw/) {
+   goto NO_INTRONCHECK;
+   }
+ @mbex=sort { $main::a->[0]<=>$main::b->[0] } @mbex;
+ my $maxi=0;
+ if (scalar(@mbex)!=scalar(@mbuf)-1) {
+  die("Error: fltgff4gv: invalid mbuf vs mbex counts for $mbuf[0]!\n");
+  }
+ for (my $i=1;$i<@mbex;$i++) {
+   my $isize=$mbex[$i]->[0]-$mbex[$i-1]->[1]-1;
+   $maxi=$isize if $maxi<$isize;
+   last if ($maxi>$maxintron);
+   }
+NO_INTRONCHECK:
+ print join("\n",@mbuf)."\n" unless ($maxi>$maxintron);
+ @mbuf=();
+ @mbex=();
+}

@@ -1,0 +1,256 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+
+my $usage=qq/
+ $0 [-f <feature>] [-U | -u <xb>] [-o <outfa>] <genomic_seq.fa> <gff_file>
+
+ The sequence of each mRNA entities found in <gff_file> is extracted
+ in a multifasta output file (written to STDOUT unless -o option is 
+ provided)
+
+ Only the first genomic sequence in <genomic_seq.fa> is considered,
+ and all coordinates in the GFF input file will be applied to it.
+ 
+ Options:
+ 
+  -f  : the segments corresponding to features of type <feature> 
+        will be extracted instead of the default "exon" features 
+        (e.g. -f CDS )
+  -U  : include the "introns" too, so for each mRNA the whole 
+        genomic region will be extracted, with unspliced introns
+  -u  : like -U but also add <xb> extra bases to both mRNA ends 
+        (upstream and downstream)
+  -o  : write the multi-fasta output to file <outfa>
+  
+ For jigsaw gff files, the -f option is ignored (as all exons 
+ will be considered). /;
+umask 0002;
+getopts('Uu:f:o:') || die($usage."\n");
+my ($unspliced, $feature, $outfile, $uxtra)=($Getopt::Std::opt_U, $Getopt::Std::opt_f, 
+                                         $Getopt::Std::opt_o,$Getopt::Std::opt_u);
+#my ($fgff, $fa, $feature, $opt)=@ARGV;
+#$feature = 'exon' unless $feature;
+$unspliced=1 if $uxtra>0;
+my ($fa, $fgff)=@ARGV;
+die ("$usage\n") unless -f $fgff && -f $fa;
+
+my %tex; # transcript_id => [start, strand, name, geneid, descr, \@exons, \@cds]
+         #                     0       1      2      3      4       5       8
+my %gid; # geneId=>[transcript_id1, transcript_id2, ..]
+my $isgtf=1;
+open(FASTA, $fa) || die ("Error opening fasta file $fa!\n");
+open(FGFF, $fgff) || die ("Error opening $fgff!\n");
+while (<FGFF>) {
+ #next if m/^\s*#/;
+ chomp;
+ my ($chr, $v, $f, $fstart, $fend, $fscore, $fstrand, $frame, $lnum)=split(/\t/);
+ next unless $lnum;
+ #next unless ($lnum && $f eq $feature || ($v=~/^jigsaw/ && $f=~/exon/));
+ ($fstart, $fend)=($fend,$fstart) if $fstart>$fend;
+
+ if (uc($f) eq 'MRNA' && $lnum=~m/ID=([^;]+)/) { #parent feature in GFF
+   my $tid=$1;
+   $isgtf=0;
+   my ($name)=($lnum=~m/Name\s*=\s*"?([^;"]+)/);
+   my ($descr, $geneid);
+   $descr=$1 if ($lnum=~m/(?:Info|Descr\w*|Product\w*)\s*=\s*"?([^;"]+)/i);
+   $geneid=$1 if ($lnum=~m/Gene\w*\s*=\s*"?([^;"]+)/);
+   #print STDERR ">>>> found transcript $tid with geneid=$geneid and descr='$descr'\n";
+   $tex{$tid}=[$fstart, $fstrand, $name, $geneid, $descr, [], []]
+      unless exists($tex{$tid});
+   push(@{$gid{$tid}}, $geneid) if $geneid;
+   next;
+   }
+
+ # -- non-parent features (or GTF lines)
+ #my ($gname)=($descr=~m/Name=(\w+)/);
+ my ($tid, $geneid);
+  if ($v=~/jigsaw/i && index($lnum, $chr)==0) {
+   ($tid)=($lnum=~m/^([^;]+)/);
+   $tid=~s/\.(\d+)$/.jsm.$1/;
+   }
+  elsif ($lnum=~m/Parent=([^;]+)/) {
+   $tid=$1;
+   #$tid=~tr/"'//d; #"
+   }
+  elsif ($lnum=~m/transcript_id[= ]+(['"\:\w\.\|\-]+)/) {
+   $tid=$1;
+   $tid=~tr/"'//d; #"
+   }
+  #elsif ($lnum=~m/^\w+$/) { } # UCSC gff ?
+  # - gtf  
+  if ($lnum=~m/gene_id[= ]+(['"\:\w\.\|\-]+)/) {
+   $geneid=$1;
+   $geneid=~tr/"'//d; #"
+   }
+  
+  unless ($tid) {
+   die("Error: cannot parse transcript ID from input line:\n$_\n");
+   }
+  #  my ($tname)=($tid=~/(\w+)/);
+
+   # [start, strand, name, geneid, descr, \@exons, \@cds]
+   #     0      1       2      3      4       5      6
+  if (lc($f) eq 'cds')  { #CDS features are ALWAYS stored
+    if (exists($tex{$tid})) { #
+      push(@{$tex{$tid}[6]}, [$fstart, $fend, $frame]);
+      my $s=$tex{$tid}[0];
+      $tex{$tid}[0]=$fstart if $fstart<$s;
+      }
+     else {    
+      $tex{$tid}=[$fstart, $fstrand, $geneid, $geneid, '', [], [$fstart, $fend, $frame]];
+      }
+    }
+   elsif (!$feature || lc($feature) eq lc($f)) { #exon or exclusively requested
+    if (exists($tex{$tid})) { #
+      push(@{$tex{$tid}[5]}, [$fstart, $fend, $frame]);
+      }
+     else {    
+      $tex{$tid}=[$fstart, $fstrand, $geneid, $geneid, '', [$fstart, $fend], []];
+      my $s=$tex{$tid}[0];
+      $tex{$tid}[0]=$fstart if $fstart<$s;
+      }
+    }
+} # while <FGFF>
+
+close(FGFF);
+# my $gfftype = $isgtf ? 'GTF' : 'GFF';
+# print STDERR "$gfftype data loaded, now loading sequence..\n";
+my ($gseq, $gseqlen); #base genomic sequence
+while (<FASTA>) {
+ next if /^>/;
+ tr/ \n\t//d;
+ $gseq.=$_;
+ $gseqlen+=length($_);
+ }
+close(FASTA);
+# print STDERR "writing transcript sequences..\n";
+if ($outfile) {
+  open(OUTF, '>'.$outfile) || die "Error creating file $outfile\n";
+  select OUTF;
+  }
+#if ($unspliced) {
+#  open(OUTFU, '>'.$outfname.'.transcripts.unspliced.fa') || die "Error creating file $outfname\n";
+#  }
+my %gc; # geneId => num_tid
+
+foreach my $tid (sort { $tex{$main::a}[0] <=> $tex{$main::b}[0] } (keys(%tex))) {
+  my $td=$tex{$tid};
+  # [start, strand, name, geneid, descr, \@exons, \@cds]
+  #     0      1       2      3      4       5      6
+  
+  my @ex = sort { $main::a->[0] <=> $main::b->[0] } @{$$td[5]};
+  my @cds = sort { $main::a->[0] <=> $main::b->[0] } @{$$td[6]};
+  my ($strand, $name, $geneid, $descr)=($$td[1], $$td[2], $$td[3], $$td[4]);
+  my ($cstart, $cend);
+  my $reverse=($strand eq '-');
+  if (@cds>0) {
+  if ($reverse) {
+      $cds[-1]->[1]-=int($cds[-1]->[2]); # adjust for initial frame
+      }
+     else {
+      $cds[0]->[0]+=int($cds[0]->[2]); # adjust for initial frame
+      }
+    ($cstart, $cend)=($cds[0]->[0], $cds[-1]->[1]);
+   }
+  
+  my @seg; #segment coordinates to extract
+  my $cdsonly=0;
+  if (lc($feature) eq 'cds' || @ex==0) {
+    @seg=@cds;
+    $cdsonly=1;
+    @ex=(); #discard exons if just CDS requested
+    }
+  if (@ex>0) { @seg=@ex; }  
+  next unless @seg>0; #nothing to do! 
+  my $startpos=$seg[0]->[0];
+  my $endpos=$seg[-1]->[1];
+  # consistency check:
+  #die("Error: startpos $startpos for $tid ($geneid) does not match stored $$td[0]!\n")
+  #  unless $startpos==$$td[0];
+  #check for overlaps just in case
+  for (my $i=0;$i<@seg; $i++) {
+       if ($i>0 && hasOverlap($seg[$i-1], $seg[$i])) {
+         die "ERROR: $tid exons have overlaps!\n";
+         }
+       }
+  my $tdefline=$tid;
+  my $tseq='';
+  my $tseqlen;
+  my ($cds_start, $cds_end);
+  if ($unspliced) { # raw region
+     $tdefline.=" [unspliced region $strand:$startpos-$endpos]";
+     $tdefline.=" gid:$geneid" if $geneid;
+     $tdefline.=" $descr" if $descr;
+     if ($uxtra) {
+       $startpos-=$uxtra;
+       $startpos=1 if $startpos<1;
+       $endpos+=$uxtra;
+       $endpos=$gseqlen if $endpos>$gseqlen;
+       }
+     $tseqlen=$endpos-$startpos+1;
+     $tseq=substr($gseq, $startpos-1, $tseqlen);
+    }
+   else { 
+     $tdefline.=" gid:$geneid" if $geneid;
+#      if ($cstart>0) {
+#        ($cstart, $cend)=($strand eq '-') ? ($endpos-$cend+1, $endpos-$cstart+1) :
+#                           ($cstart-$startpos+1, $cend-$startpos+1);
+#        }
+#      $tdefline.=" CDS:$cstart-$cend";
+     foreach my $s (@seg) {
+      if ($cstart) {
+         if (!$cds_start && $cstart>=$$s[0] && $cstart<=$$s[1]) {
+             $cds_start=$tseqlen+($cstart-$$s[0])+1;
+             }
+         if (!$cds_end && $cend>=$$s[0] && $cend<=$$s[1]) { #CDS end within this exon
+             $cds_end=$tseqlen+($cend-$$s[0])+1;
+             }
+         } #CDS info available
+       my $seglen=$$s[1]-$$s[0]+1;
+       my $segseq=substr($gseq, $$s[0]-1, $seglen);
+       $tseq.=$segseq;
+       $tseqlen+=$seglen;
+       } #for each seq segment
+     }# -- exon/CDS splicing 
+   if ($cstart) {
+     ($cds_start, $cds_end)=($tseqlen-$cds_end+1, $tseqlen-$cds_start+1) if ($reverse);
+     $tdefline.=" CDS:$cds_start-$cds_end";
+     }
+   $tdefline.=" $descr" if $descr;
+   $tseq=reverseComplement($tseq) if $reverse;
+   
+   print &fastafmt(\$tseq, $tdefline);
+}
+
+select(STDOUT);
+close(OUTF) if $outfile;
+
+#-------------------------
+
+sub reverseComplement {
+  my $s=reverse($_[0]);
+  $s =~ tr/AaCcTtGgUuMmRrWwSsYyKkVvHhDdBb/TtGgAaCcAaKkYyWwSsRrMmBbDdHhVv/;
+  return $s;
+ }
+
+sub fastafmt {
+ my $seqr=shift(@_);
+ my $defline=shift(@_);
+ my $linelen=shift(@_) || 70;;
+ my $rec;
+ $rec=">$defline\n" if $defline;
+ my $seqlen=length($$seqr);
+ my $pos=0;
+ while ($pos<$seqlen) {
+   $rec.= substr($$seqr,$pos,$linelen)."\n";
+   $pos+=$linelen;
+   }
+ return $rec;
+ }
+
+sub hasOverlap {
+ my ($a, $b)=@_;
+ return !($$a[0]>$$b[1] || $$b[0] > $$a[1]);
+}

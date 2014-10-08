@@ -1,0 +1,117 @@
+#!/bin/bash
+mypath=~/bin
+tdir0=/usr/bin
+
+#update these accordingly:
+tdir45=/data1/igm3/sw/packages/gcc-4.5.4/bin
+tdir45st=/data1/igm3/sw/packages/gcc-4.5.4-static/bin
+tdir46=/data1/igm3/sw/packages/gcc-4.6.3-static/bin
+tdir47=/data1/igm3/sw/packages/gcc-4.7.2/bin
+tdir48=/data1/igm3/sw/packages/gcc-4.8.1/bin
+tdir49=/data1/igm3/sw/packages/gcc-4.9.0/bin
+llvmdir=/data1/igm3/sw/packages/llvm-gcc/bin
+tdir="x"
+case "$1" in
+#  [24] )
+#     #tdir=$tdir42
+#     tdir=""
+#     ;;
+   0 | def | sys | system | default )
+     tdir=$tdir0
+     ;;
+   5 | 45 | 5d | 45d )
+     tdir=$tdir45
+     ;;
+   s | st | 5s | 5st | 45s )
+     tdir=$tdir45st
+     ;;
+   6 | 46 )
+     tdir=$tdir46
+     ;;
+   7 | 47 )
+     tdir=$tdir47
+     ;;
+   8 | 48 )
+     tdir=$tdir48
+     ;;
+   [n9] | 49 | new | last )
+     tdir=$tdir49
+     ;;
+#   ll | llvm )
+#     tdir=$llvmdir
+#     ;;
+  esac
+#echo "tdir=$tdir"
+
+function showCurrent {
+ hash -r
+ whichgcc=$(which gcc)
+ echo "#### GCC currently set as: "
+ symlnk=$(readlink $whichgcc)
+ local LGREEN="\e[1;32m"
+ local LCYAN="\e[1;36m"
+ local NOC="\e[0m"
+ if [ -n "$symlnk" ]; then
+    echo -e "${LCYAN}$whichgcc -> ${LGREEN}$symlnk${NOC}"
+   else
+    echo -e "${LGREEN}$whichgcc${NOC}"
+   fi
+ gcc -v 2>&1 | tail -1
+}
+
+if [[ "$tdir" = "x" || "x$1" = "x" ]]; then
+ if [[ -n "$1" ]]; then 
+   echo "ERROR: choice unrecognized."
+ fi
+ echo "Usage: "
+ echo " setgcc {0|def|default|sys|system|o|old} (to set the default system version)"
+ echo "   OR"
+ echo " setgcc {5|45|5d|45d} (to switch to gcc 4.5.x)"
+ echo "   OR"
+ echo " setgcc {5s|45s|5st} (to switch to gcc 4.5.x statically linked)"
+ echo "   OR"
+ echo " setgcc {6|46} (to switch to gcc 4.6.x)"
+ echo "   OR"
+ echo " setgcc {7|47} (to switch to gcc 4.7.x)"
+ echo "   OR"
+ echo " setgcc {8|48} (to switch to gcc 4.8.x)"
+ echo "   OR"
+ echo " setgcc {9|49|n|new|last} (to switch to gcc 4.9.x)"
+# echo " setgcc {ll|llvm} (to set the custom llvm-gcc version)"
+ showCurrent
+ exit
+fi
+
+cd $mypath
+#pwd
+# these must all be symbolic links!
+/bin/rm -f cc c++ cpp g++ gcc gccbug gcov gcc-ar gcc-nm gcc-ranlib
+/bin/rm -f gccgo llvm-cpp
+/bin/rm -f gfortran
+/bin/rm -f gcc34
+/bin/rm -f gccmakedep
+/bin/rm -f x86_64-*linux-*{gcc,g++,c++}
+
+if [[ -z "$tdir" ]]; then 
+ showCurrent
+ exit
+ fi
+if [[ "$tdir" == "$llvmdir" ]]; then
+ ln -s $llvmdir/llvm-gcc gcc
+ ln -s $llvmdir/llvm-gcc cc
+ ln -s $llvmdir/llvm-g++ g++
+ ln -s $llvmdir/llvm-g++ c++
+ ln -s $llvmdir/llvm-gcov gcov
+ ln -s $llvmdir/llvm-gfortran gfortran
+ ln -s $llvmdir/llvm-cpp  .
+ ln -s $llvmdir/llvm-cpp cpp
+else
+ ln -s $tdir/{c++,g++,cpp,gcov,gcc*} .
+ ln -s $tdir/x86_64-*linux-*{gcc,g++,c++} .
+ ln -s $tdir/gcc cc
+ if [[ -f $tdir/gfortran ]]; then
+    ln -s $tdir/gfortran .
+    fi
+fi
+
+showCurrent

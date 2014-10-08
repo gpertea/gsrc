@@ -1,0 +1,23 @@
+#!/usr/bin/perl
+use strict;
+
+my $usage=qq/
+ Usage
+  wwget [scp_opts] remote_filepaths..
+
+  Note: scp -pr options are already provided.
+/;
+
+die "$usage\n" unless @ARGV>=1;
+my $host='igm3.pha.jhu.edu';
+my $opts;
+while ($ARGV[0]=~m/^\-[BCpqrv\d]+/) {
+ $opts.=shift(@ARGV).' ';
+ }
+my @files=@ARGV;
+foreach (@files) {
+ $_=$ENV{PWD}.'/'.$_ unless m/^\//;
+ s{^/.+?/httpd/ccb}{/data1/igm3/www/ccb.jhu.edu};
+ my $cmd='scp '.$opts.' -pr '.$host.':'."'".$_."'".' .';
+ system($cmd);
+ }

@@ -1,0 +1,64 @@
+#!/bin/tcsh -f
+# Manages privoxy daemon, allows switching between different configs if
+# setup right.  
+
+set usage="Usage:\npvxctl {start|stop} [<config>]"
+
+# where actions, templates, etc. are stored
+# need to chdir into here so paths work properly
+set PRIVOXYCONF=$HOME/ann/misc/cfg/privoxy
+
+# where config files are stored.  these need to
+# reference PRIVOXYCONF directory properly
+set PRIVOXYRC=$PRIVOXYCONF
+set DEFAULTCFG=config
+# where to find privoxy application
+set PRIVOXY=$HOME/ann/misc/privoxy
+
+# sanity checks
+if (! -x $PRIVOXY) then
+  echo "Error: no executable program: $PRIVOXY"
+  exit 1
+endif
+
+if (! -d $PRIVOXYCONF) then
+  echo "Error: no such directory: $PRIVOXYCONF"
+  exit 1
+endif
+set opt=$1
+set MODE=$2
+
+if ("x"$opt == "x") then
+  echo "$usage"
+  exit 1
+endif
+
+if ($opt =~ /-h/) then
+    echo "$usage"
+    exit 1
+endif
+# routine to find, kill privoxy
+#if ($opt == "stop") then
+  foreach ps ( `pgrep -l -f "$PRIVOXY" | tr ' \t' '~~'` )
+    set psline=$ps:s/~/ /
+    set psline=`echo $psline:q`
+    set pid=$psline[1]
+    # echo "pid is $psline[1]"
+    set cmdline=`echo $psline[2] | tr '~' ' '`
+    echo "killing pid $pid ($cmdline)"
+    kill $pid
+  end
+#endif
+if ($opt != "start") exit 0
+
+if ("x"$MODE == "x")then
+ set MODE=$DEFAULTCFG
+endif
+
+if (! -s $PRIVOXYRC/$MODE) then
+ echo "Error: config file not found ($PRIVOXYRC/$MODE)"
+ exit 1
+endif
+
+cd $PRIVOXYRC
+exec $PRIVOXY --no-daemon $MODE

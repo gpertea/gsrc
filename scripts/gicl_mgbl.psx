@@ -1,0 +1,121 @@
+#!/usr/bin/perl
+use strict;
+use FindBin;
+
+umask 0002;
+#the line below is needed if pvmsx is used
+# also, the error condition is set only by the presence of $file 
+chdir($ENV{PVMSX_WD}) if ($ENV{PVMSX_WD});
+
+
+$ENV{'PATH'}=$FindBin::Bin.':'.$ENV{'PATH'};
+
+#so for pvmsx to consider the task was successful, $file must be deleted!
+#============== 
+# 1 is the name of the fasta sequence input file
+# 2 is the # of sequences in ${1} should = 1 for this script
+# 3 is the slice no. being processed by sx
+# 4 is 0 if not the last file, 1 if the last file
+# 5 is the # of sequences skipped initially
+# 6 is the # of sequences to be processed (-1 = ALL)
+# 7 user parameter
+#     1        2        3         4          5       6    
+my ($file, $numpass, $slice_num, $last, $skipped, $total, $userparams)=@ARGV;
+#user parameters:
+# 1) database (full path)
+# 2) PID cutoff (using 94 if not specified)
+# 3) maximum overhang
+# 4) minimum overlap
+# 5) extra flags (optional)
+# flags: M = no masking, D= separate database (not all-vs-all)
+#        G = show gaps
+my ($searchdb,$pid,$maxovh,$minovl, $xflags)=split(/:/,$userparams);
+my $mgblast_res=$file.'.tab';
+my $nomasking = $xflags=~/M/;
+my $gapinfo = $xflags=~/G/;
+my $otherDb = $xflags=~/D/;
+
+#$pid=94 unless $pid>50;
+$pid=96 unless $pid>90;
+#$minovl=40 unless $minovl;
+$minovl=32 unless $minovl;
+my $log_file='log_std';
+my $err_file='err_log';
+open(STDERR, '>>'.$err_file);
+open(STDOUT, '>>'.$log_file);
+
+my $toskip=($file =~ m/_\@(\d+)_v\d+\.\d+/) ? $1 : $skipped+$numpass*($slice_num-1);
+print STDERR '<'.join('> <',@ARGV)."> toskip='$toskip', pid='$pid'\n";
+#= mgblast weakness - when some query seqs are entirely masked
+#= or what's left is just low complexity, it will abort the search
+#= so let's filter the input in advance
+unless ($nomasking) {
+ my $renfile=$file.'_cpy';
+ rename($file, $renfile) || die "Cannot rename '$file' to '$renfile'!\n";
+ local $/="\n>";
+ open (INFILE, "mdust -m L < $renfile |") || die "Cannot open renamed file '$renfile'\n"; 
+ open (OUTFILE, '>'.$file) || die "Cannot create flt file '$file'\n";
+ open (MASKED, '>>masked.lst') || die "Cannot open masked.lst for append\n";
+ open (TOOSHORT, '>>tooshort.lst') || die "Cannot open tooshort.lst for append\n";
+
+ my $counter;
+ while(<INFILE>) {
+  s/^>//;
+  chomp;
+  $counter++;
+  my ($defline, $seq)=(m/^(.+?)\n(.+)/s);  
+  my $s=$seq;
+  $s =~ tr/\n \t//d;
+  my $seqlen=length($s);
+  if ($seqlen<$minovl) {
+   print TOOSHORT $defline."\n";
+   next;
+   }
+  my @uc=($s =~ m/([A-M,O-W,Y,Z]+)/g);
+  my $valid;
+  foreach my $l (@uc) {
+    if (length($l)>12) { # a valid stretch of at least 12nt would suffice
+       $valid=1;
+       last;
+       }
+    }
+ if ($valid) {
+  print OUTFILE '>'.$defline."\n".$seq."\n";
+  }
+ else {
+  print MASKED $defline."\n";
+  }
+ } #while
+ close(INFILE);close(OUTFILE);close(MASKED);close(TOOSHORT);
+ die "Error: no sequence in this slice!\n" unless $counter; 
+ unlink($renfile);
+}
+# originally: -W18 -X16
+my $cmd="mgblast -i $file -d $searchdb -p $pid -W22 -X12 ". 
+   "-JF -v9000000 -b9000000 -C$minovl -H$maxovh ";
+$cmd.=$gapinfo ? ' -D5 ':' -D4 ';
+$cmd.= ($nomasking) ? ' -FF -UF '  : ' -UT -F "m D" ';
+unless ($otherDb) {
+ $cmd.=' -KT ';
+ $cmd.= " -k $toskip " if $toskip>0; 
+ }
+$cmd.=" > $mgblast_res";
+my $slno=sprintf("slice:%09d",$slice_num);
+print STDERR ">>$slno: $cmd\n";
+
+my $errmsg = `($cmd) 2>&1`;
+print STDERR "<<$slno: done.\n";
+
+if ($? || ($errmsg=~/ERROR/i) || ($errmsg=~/Segmentation/i)) {
+  print STDERR "!Error at:\n$cmd\n";
+  print STDERR "$errmsg\n";
+  exit(1);
+  }
+$cmd="sort -k11,11g -k10,10nr -k9,9nr $mgblast_res | gzip -cf > $mgblast_res.gz";
+my $r=system($cmd);
+if ($r && ($r>>8 != 2) ) {
+   die "Error sorting/compressing the results file '$mgblast_res'\n$cmd\n";
+   }
+ 
+unlink($file, $mgblast_res);
+exit 0;

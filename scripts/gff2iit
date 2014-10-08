@@ -1,0 +1,422 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+
+my $usage = q/Usage:
+ gff2itt [-o <output_name>] [-XAIQGKNT | -R] [-BLCP] [-t <track_label>] \
+         [-c <CDS.gtf>] <input_gff>
+ 
+ Options:
+ -R  raw GFF record storage for each transcript (most options below are ignored)
+   OR
+ -X  generic GFF storage using new iit_store chr: format
+ -T  do not include the track tag in the output
+ -I  same as -T, but append the track label to the info line (i:...)
+ -K  add the track as a t: line for each record
+ -N  add the gene name, if found, as a g: line
+ -C  format the record ID as t|<transcript>|g|<gene> for cdbfasta indexing
+ -Q  do not include query information data in the output
+ -G  the input is GFF annotation instead of scored mappings (implies -Q, 
+     -C, -N and uses the new iit_store with -F option)
+ -A  write any other GFF\/GTF attributes as a comma delimited list of 
+     <attrname>=<value> pairs in the i: line
+ -c  the provided <CDS.gtf> file contains valid CDS for some of entries in 
+     <input_gff> and they will be applied to the <input_gff> 
+
+ Common options:
+ -B  the genomic sequence tag will not include the strand character
+     (so intervals on both strands will be returned by a iit_get query 
+      and a 's:' line will be added instead)
+ -L  skip 'locus' features (e.g. those created by annbygff)
+ -P  skip pseudo* features (e.g. pseudogenes, pseudoRNA etc)
+
+ If query coordonate info is found in the gff file, a line with query 
+ alignment coordinates for each exon will be added:
+ 
+ q:[<qrylen>]:<qexon1start>-<qexon1end>,<qexon2start>-<qexon2end>,...
+ (<qrylen> may not be available)
+ x:<coord1-coord2>,...
+ 
+ The "x:..." line is added if the query coordinates show an internal gap (possible 
+ exon alignments missing). 
+/;
+umask 0002;
+getopts('ATIQBGKNCXPRLt:g:o:c:') || die($usage."\n");
+my $cdbformat=$Getopt::Std::opt_C;
+my $gffAttrs=$Getopt::Std::opt_A;
+my $rawStorage=$Getopt::Std::opt_R;
+my $trackline=$Getopt::Std::opt_K;
+my $geneline=$Getopt::Std::opt_N;
+my $outfile=$Getopt::Std::opt_o;
+my $plainGff=$Getopt::Std::opt_G;
+my $newDivFmt=$Getopt::Std::opt_X;;
+$plainGff=1 if $newDivFmt;
+my $track=$Getopt::Std::opt_t;
+my $skiploci=$Getopt::Std::opt_L;
+my $nopseudo=$Getopt::Std::opt_P;
+my $noTrack=$Getopt::Std::opt_T || $Getopt::Std::opt_I || $trackline;
+my $track2info=$Getopt::Std::opt_I;
+my $noStrand=$Getopt::Std::opt_B;
+my $noQdata = $plainGff || $Getopt::Std::opt_Q;
+
+if ($plainGff) {
+ #$cdbformat=1; # use -C to enable this
+ $trackline=1 unless $noTrack;
+ $noTrack=1;
+ $geneline=1;
+ $noStrand=1;
+ #$skiploci=1;
+ }
+if ($rawStorage) {
+ $noTrack=1;
+ $noQdata=1;
+ $newDivFmt=1;
+ $gffAttrs=0;
+ }
+my $cdsfile=$Getopt::Std::opt_c;
+#my $gene_type=$Getopt::Std::opt_g || 'mRNA';
+
+my $infile = shift(@ARGV) || die("$usage\nNo input file/stream provided!\n");
+
+my $inh;
+my %vcds; # transcript_id => [ cds1, cds2, cds3 ... ]
+if ($cdsfile) {
+ open(CDSF, $cdsfile) || die ("Error opening $cdsfile!\n");
+ while (<CDSF>) {
+   next if m/^\s*#/;
+   chomp;
+   my ($chr, $v, $f, $fstart, $fend, $fscore, $strand, $frame, $lnum)=split(/\t/);
+   next unless $f eq 'CDS';
+   my ($tid)=($lnum=~m/transcript_id[= ]+(['"\:\w\.\|\-]+)/);
+   die ("Error parsing transcript_id for CDS!\n$_\n") unless $tid;
+   $tid=~tr/"//d; #"
+   ($fstart, $fend)=($fend, $fstart) if $fend<$fstart;
+   push(@{$vcds{$tid}}, [$fstart, $fend, $fscore]);
+   }
+ close(CDSF);
+ }
+
+
+if ($infile eq '-') {
+  $inh=\*STDIN;
+  $outfile='gff2iit_stdin' unless $outfile;
+  }
+ else {
+  open(INFILE, $infile) || die("Error opening input file $infile!\n");
+  $inh=\*INFILE;
+  unless ($outfile) {
+    $outfile=$infile;
+    $outfile=~s/\.\w+$//; #remove extension if any
+    }
+  }
+
+
+#                        0     1       2         3        4     5       6       7         8      9     10      11     12       13
+my %recs; # recID =>  [ tag, track, [@exons], [@cds],  lstart, lend, $strand, $tdescr, $qlen, $mcov, $mpid, $gname, $ftype, $attrline ]
+             #   
+my @reclist; # just a plain list of record IDs, in the input order
+my $curtag; #chromosome and strand for current model
+
+my @exd; #exons for current model
+my @cds; #cds segments if -C flag was used
+my ($qlen, $hasQregs, $qxgap);
+open(IFA, ">$outfile.ifa")  
+ || die("Error creating file $outfile.ifa ($!)!\n");
+while (<$inh>) {
+   next if m/^\s*#/;
+   my $gffline=$_; #keep a raw copy of the current line
+   chomp;
+   my ($chr, $v, $f, $fstart, $fend, $fscore, $strand, $frame, $lnum)=split(/\t/);
+   my ($mcov, $mpid, $gname, $tdescr);
+   $mcov='89.89' unless $plainGff;
+   my $curtrack=$track || $v;
+   next unless $fstart>1 && $lnum;
+   next if $f eq 'gene'; # Warning: skipping any 'gene' features, unconditionally
+   next if $skiploci && $f eq 'locus';
+   next if $nopseudo && $f=~m/^pseudo/i;
+   my $gff3_ID;
+   my $gff3_Parent;
+   ($fstart, $fend)=($fend, $fstart) if $fend<$fstart;
+   ($gff3_ID)=($lnum=~m/\bID=([^;]+)/);
+   ($gff3_Parent)=($lnum=~m/\bParent=([^;]+)/);
+   my $isGff3=($gff3_ID || $gff3_Parent);
+   #($tdescr, $gname, $mcov, $mpid)=('','','',0);
+   if ($isGff3) { # GFF format
+      $gff3_ID=~tr/"//d; #"
+      $gff3_Parent=~tr/"//d; #"
+      $gff3_Parent='' if ($f eq 'mRNA');
+      if ($gff3_ID && !$gff3_Parent) { #top level feature starting
+         if ($f=~m/RNA/i) {
+           # try to parse the description, if any
+           if ($lnum=~m/\b(?:descr|tophit|info|product)\s*=\s*"?([^;"]+)/i) {
+             $tdescr=$1;
+             }
+            elsif ($lnum=~m/Name\s*=\s*"?([^;"]+)/) {
+             $tdescr=$1;
+             }
+           if ($lnum=~m/\bgene_name[\s=]+"?([^;"]+)/i) {
+             $gname=$1;
+             }
+            elsif ($lnum=~m/gene\s*=\s*"?([^;"]+)/) {
+             $gname=$1;
+             }
+           $tdescr='' if ($tdescr eq $gname);
+           if ($lnum=~m/\bcov=([\.\d]+)/i) {
+              $mcov=$1;
+              }   
+           if ($lnum=~m/\b(?:pid|Identity|Similarity)=([\.\d]+)/i) {
+              $mpid=$1;
+              }
+           unless ($mpid) {
+             $mpid = ($fscore>40 && $fscore<=100) ? $fscore : '89.89';
+             }
+           $qlen='';
+           $hasQregs=0;
+           $qxgap='';
+           if ($lnum=~m/qxgap=([\-\, \d]+)/) {
+              $qxgap=$1;
+              }
+           if ($lnum=~m/\bqreg=\d+\-\d+\|(\d+)/i) {
+              $qlen=$1;
+              }
+             elsif ($lnum=~m/\bqlen=(\d+)/i) {
+              $qlen=$1;
+              }
+           }
+         if ($f eq 'locus' && $lnum=~m/transcripts=([^;]+)/) {
+           $tdescr.=' ' if $tdescr; 
+           $tdescr.='['.$1.']';
+           }
+         my $recID=$chr."\x80".$gff3_ID;
+         die("Error: duplicate feature $gff3_ID on $chr\n") if (exists($recs{$recID}));
+         $curtag=$chr;
+         $curtag.=$strand unless $noStrand;
+         $curtrack=$track || $v;
+         push(@reclist, $recID);
+         my $dataline;
+         if ($gffAttrs) {
+            $dataline=parseAttrs($lnum, 1);
+            }
+         else {
+           if ($rawStorage) {
+            $dataline=$gffline;
+            }
+           }
+         $recs{$recID} = [$curtag, $curtrack, [], [] , $fstart, $fend, $strand, $tdescr, $qlen, $mcov, $mpid, $gname, $f, $dataline];
+         #($tdescr, $gname, $mcov, $mpid)=('','','',0);
+         next;
+         } # parent/top-level feature
+      } #GFF3 format
+     else { #GTF format
+      next if ($f eq 'transcript'); #exception: GTF with parent 'transcript' feature
+      }
+   #my ($gname)=($descr=~m/Name=(\w+)/);
+   #---------------------------
+   # -------------- exon/CDS line here:
+   my $recID;
+   my ($qstart, $qend);
+   unless ($noQdata) {
+   if ($lnum=~m/\bQ[regmatch]+=(\d+)[\- ]+(\d+)/i) {
+     ($qstart, $qend)=($1,$2);
+     ($qstart,$qend)=($qend,$qstart) if $qend<$qstart;
+     $hasQregs++;
+     }
+    }
+   if ($v=~/^jigsaw/ && $lnum=~m/^\d+$/) {
+     $recID=$chr.'.jsm.'.$lnum;
+     $curtrack='jigsaw' unless $track;
+     }
+    elsif ($lnum=~m/Parent=(['"\:\w\|\-\.]+)/) {
+     $recID=$1;
+     $recID=~tr/"//d; #"
+     }
+    elsif ($lnum=~m/transcript_id[= ]+(['"\:\w\.\|\-]+)/) {
+     $recID=$1;
+     $recID=~tr/"//d; #"
+     }
+    else {
+     die("Error: cannot parse locus/transcript name from input line:\n$_\n");
+     }
+   if (!$gname && $lnum=~m/gene_id[= ]+(['"\:\w\.\|\-]+)/) {
+      #$recID=$1;
+      #$recID=~tr/"//d; #"
+      $gname=$1;
+      $gname=~tr/"//d; #"
+      }
+   $tdescr='' if index($recID, $tdescr)>=0;
+   $curtag=$chr;
+   $curtag.=$strand unless $noStrand;
+   $recID=$chr."\x80".$recID;
+   my $ld = $recs{$recID};
+   $fscore=$mpid if ($fscore eq '.');
+   if ($ld) { #existing entry
+     my $i=($f eq 'CDS') ? 3 : 2;
+     my ($lstart, $lend)=($$ld[4], $$ld[5]);
+     $$ld[4]=$fstart if $fstart<$lstart;
+     $$ld[5]=$fend if $fend>$lend;
+     push(@{$$ld[$i]}, [$fstart, $fend, $fscore, $qstart, $qend]);
+     if ($rawStorage) {
+        # special case: append GFF lines
+        $$ld[13].=$gffline;
+        }
+     }
+    else { # first time seeing this locus/gene
+     push(@reclist, $recID);
+     my $dataline;
+     if ($gffAttrs) {
+           $dataline=parseAttrs($lnum, $isGff3) 
+           }
+     else {
+        if ($rawStorage) {
+          $dataline=$gffline;
+          }
+        }
+     $recs{$recID} = ($f eq 'CDS') ? 
+           [$curtag, $curtrack, [], [[$fstart, $fend, $fscore, $qstart, $qend]] , $fstart, $fend, $strand, $tdescr, 
+                                        $qlen, $mcov, $mpid, $gname, $f, $dataline ] :
+           [$curtag, $curtrack, [[$fstart, $fend, $fscore, $qstart, $qend]], [ ], $fstart, $fend, $strand, $tdescr, 
+                                        $qlen, $mcov, $mpid, $gname, $f, $dataline ] ;
+     }
+} #while <>
+
+writeModels();
+
+close(INFILE) unless $infile eq '-';
+close(IFA);
+system("iit_store -o $outfile.iit < $outfile.ifa");
+
+
+#=============================================================
+
+sub writeModels {
+ foreach my $l (@reclist) {
+   my $ld=$recs{$l} || die ("Error: locus $l found in list but not in hash!\n");
+   my ($a,$b)=split(/\x80/,$l);
+   $l=$b if $b; # was formatted as chr[0x80]ID, so we peel off chr prefix
+   #     0     1     2    3     4        5      6        7     8      9     10    11  
+   my ($tag, $trck, $er, $cr, $lstart, $lend, $strnd, $descr, $ql, $qcov, $qpid, $gn, 
+                  $ftype, $attrline) = @$ld;
+   my ($mstart,$mend)=($lstart, $lend);
+   my (@ex, @cds); 
+   if (@$er>0) {
+     @ex= sort { $main::a->[0] <=> $main::b->[0] } @$er;
+     ($mstart, $mend) = ($ex[0]->[0], $ex[-1]->[1]);
+     }
+     
+   if (@$cr==0 && $cdsfile) {
+      $cr=$vcds{$l};
+      }
+   if ($cr && @$cr>0) {
+     @cds= sort { $main::a->[0] <=> $main::b->[0] } @$cr;
+     ($mstart, $mend) = ($cds[0]->[0], $cds[-1]->[1]) unless $mstart;
+     }
+   my $intv_tag="$mstart $mend $tag";
+   if ($newDivFmt) {
+      my $chr=$tag;
+      $chr=~s/[\-\+]$//;
+      $intv_tag="$chr:$mstart..$mend $strnd";
+      }
+   if ($cdbformat) {
+      print IFA ">t|$l";
+      print IFA "|g|$gn" if $gn;
+      print IFA " $intv_tag";
+      }
+     else {
+      if ($rawStorage) {
+        print IFA ">t|$l|loc|$tag\:${mstart}_$mend $intv_tag";
+        }
+       else {
+        print IFA ">$l $intv_tag";
+        }
+      }
+   print IFA " $trck" unless $noTrack;
+   print IFA "\n";
+   if ($rawStorage) {
+       print IFA $attrline;
+       print IFA "\n" unless substr($attrline, -1) eq "\n";
+       next;
+       }
+   my @qregs;
+   if (@ex) {
+     my @wlst; 
+     if ($plainGff) {
+       @wlst = map { $_->[0].'-'.$_->[1] } @ex;
+       }
+      else {
+       @wlst = map { $_->[0].'-'.$_->[1].':'.$_->[2]  } @ex;
+       } 
+     print IFA join(',',@wlst)."\n";
+     if ($hasQregs) {
+       @qregs = map { [$_->[3], $_->[4], $_->[0], $_->[1] ] }  @ex;
+       }
+     }
+   if ($track2info) {
+     $descr=$descr ? $descr.' '.$trck : $trck;
+     $descr='' if $descr eq ' ';
+     }
+   if (@cds) {
+     my @wlst;
+     if ($plainGff) {
+       @wlst = map { $_->[0].'-'.$_->[1] } @cds;
+       }
+      else { 
+      @wlst = map { $_->[0].'-'.$_->[1].':'.$_->[2]  } @cds;
+      }
+     print IFA 'C:'.join(',',@wlst)."\n";
+     if ($hasQregs && (@qregs==0)) {
+       @qregs = map { [$_->[3], $_->[4], $_->[0], $_->[1] ] } @cds;
+       }
+     }
+   if ($noStrand && !$newDivFmt) {
+     print IFA 's:'.$strnd."\n";
+     }
+   if ($ftype && $geneline) {
+     print IFA 'f:'.$ftype."\n" unless $ftype eq 'exon' || $ftype eq 'CDS';
+     }
+   if ($trackline) {
+     print IFA 't:'.$trck."\n";
+     }
+   if ($gffAttrs && $attrline) {
+     print IFA 'i:'.$attrline."\n";
+     }
+   else {
+     if ($gn && $geneline) {
+       print IFA 'g:'.$gn."\n";
+       }
+     if ($descr) {
+       print IFA 'i:'.$descr."\n";
+       }
+     }
+  if ($qcov) {
+     print IFA 'v:'.$qcov."\n";
+     }
+  next if ($noQdata);
+  if ($hasQregs) {
+     print IFA 'q:'.$ql.':'.join(',',  ( map { $_->[0].'-'.$_->[1] } @qregs ))."\n";
+     my @xgaps;
+     for (my $i=1;$i<@qregs;$i++) {
+       #check for gaps between query exons
+       my ($qstart, $qend)= ($qregs[$i-1]->[0]>$qregs[$i]->[0]) ? 
+                ($qregs[$i]->[1], $qregs[$i-1]->[0]) : ($qregs[$i-1]->[1], $qregs[$i]->[0]);
+       push(@xgaps,$qregs[$i-1]->[3].'-'.$qregs[$i]->[2]) if ($qend-$qstart>4);
+       }
+     print IFA 'x:'.join(',',@xgaps)."\n" if (@xgaps>0);
+     }
+    elsif ($qxgap) {
+     print IFA 'x:'.$qxgap."\n";
+     }
+  } #for each stored locus
+}
+
+sub parseAttrs {
+ my ($l, $isGff3)=@_;
+ my $attrline;
+ $l=~s/(Parent|ID|transcript_id|gene_id|exon|exon_number)[= ]+[^;]+;?//g;
+ $l=~s/^[\s\;]+//;
+ $l=~s/; /;/g;
+ $l=~s/[\s\;]+$//;
+ if (!$isGff3) {
+   $l=~s/\s+\"([^"]+)\"/=$1/g;
+   }
+ return $l;
+}

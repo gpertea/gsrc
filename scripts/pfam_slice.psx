@@ -1,0 +1,63 @@
+#!/usr/bin/perl
+use strict;
+umask 0002;
+my $usage=q{
+gridx/psx slice processing script for pfam - never to be used by itself.
+ 
+ Usage:
+ 
+gridx [gridx_opts] -i <proteinfile> pfam_slice.psx <pfam_domains_dir> \
+  [pfam_scan.pl_options]
+ 
+ Example:
+ 
+gridx -p 20 -n 1000 -m gpertea -q -i tranprots.fa pfam_slice.psx \
+ /fs/szgenefinding/domains/pfam --fast
+ 
+ (searching 1000 proteins at a time from input file tranprots.fa,
+  using at most 20 cpus on the grid; notify user gpertea by e-mail 
+  when finished)
+};
+
+# 1 is the name of the slice file 
+# 2 is the # of sequences in the slice file
+# 3 is the slice# being processed (1-based)
+# 4 is 1 if this is the last slice, 0 if not the last slice
+# 5 is the # of sequences skipped initially
+# 6 is the upper limit of slices to be processed (-1 = ALL)
+# 7.. user parameters
+#     1        2        3         4          5       6       7       ...
+my ($file, $numpass, $slice_num, $last, $skipped, $total, $pfamdir, @otheropts)=@ARGV;
+
+die "$usage\n" unless -d $pfamdir;
+
+my $log_file='log_std';
+my $err_file='err_log';
+# -- redirect output just in case..
+open(STDERR, '>>'.$err_file);
+open(STDOUT, '>>'.$log_file);
+
+my $pfam_res=$file.'.pfam';
+my $pfamopts=join(' ',@otheropts);
+my $cmd="/fs/szannotation/bin/pfam_scan.pl $pfamopts -d $pfamdir".
+  " -o $pfam_res $file";
+my $slno=sprintf("slice:%09d",$slice_num);
+print STDERR ">>$slno: $cmd\n";
+&runCmd($cmd, $pfam_res);
+print STDERR "<<$slno: done.\n";
+
+unlink($file);
+exit 0;
+
+sub runCmd {
+my ($docmd, @todel) = @_;
+my $errmsg = `($docmd) 2>&1`;
+if ($? || ($errmsg=~/ERROR/si) || ($errmsg=~/Segmentation/si) || ($errmsg=~/Failed/s) || $errmsg=~/Invalid/s) {
+  print STDERR "!Error at:\n$docmd\n";
+  print STDERR "$errmsg\n";
+  foreach (@todel) {
+    unlink($_);
+    }
+  exit(1);
+  }
+}

@@ -1,0 +1,42 @@
+#!/usr/bin/perl
+#
+#pipe a multi-fasta into this and get the sequence size for each fasta record
+#
+my $usage=q/
+  Reports the sequence length for each record in a multi fasta file
+  The output line format is (tab delimited):
+  <seq_name> <seq_len> [<seq_description>]
+
+  Use '-S' to get a summary of the sequences read.
+  /;
+die $usage."\n" if ($ARGV[0]=~m/^\-+h/);
+my $summary=$ARGV[0] eq '-S';
+shift(@ARGV) if $summary;
+local $/="\n>";
+my ($minlen, $min, $max, $maxlen, $total, $avg, $std);
+$minlen=2000000000;
+my @v; #
+while (<>) {
+ s/^>//;
+ chomp;
+ my ($seqname, $ann, $seq)=(m/^(\S+)[ \t\x01]*([^\n]*)\n?(.*)/s);
+ my @nr=split(/\x01/, $ann, 2);
+ $ann=$nr[0] if (@nr>1);
+ $seq =~ tr/\t \n\r//d;
+ my $len=length($seq);
+ my @l=($seqname, $len);
+ push(@l,$ann) if $ann;
+ push(@v, $len);
+ $total+=$len;
+ ($minlen, $min)=($len, $seqname) if ($len<$minlen);
+ ($maxlen, $max)=($len, $seqname) if ($len>$maxlen);
+ print join("\t",@l), "\n";
+}
+my $numseqs=@v;
+if ($summary) {
+ #TODO: calculate variance
+ print STDERR "Total $total bases in $numseqs sequences.\n";
+ print STDERR "Max length: $maxlen (sequence $max)\n";
+ print STDERR "Min length: $minlen (sequence $min)\n";
+ print STDERR "Average   : ".int($total/$numseqs)."\n";
+ }

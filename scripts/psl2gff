@@ -1,0 +1,196 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+#use FindBin;use lib $FindBin::Bin;
+
+my $usage = q/Usage:
+ psl2gff [-p <minpid>] [-c <minqrycoverage>] [-P] <psl_file>
+ Outputs a gff3-formatted version of the Blat's mapping data
+ (generating 'mRNA' and 'exon' tags only)
+ Use -P if the psl comes from protein-to-genome mappings.
+/;
+umask 0002;
+die "$usage\n" if $ARGV[0]=~m/^\-+h/;
+#----------------------
+#  0  matches int unsigned ,       # Number of bases that match that aren't repeats
+#  1  misMatches int unsigned ,    # Number of bases that don't match
+#  2  repMatches int unsigned ,    # Number of bases that match but are part of repeats
+#  3  nCount int unsigned ,        # Number of 'N' bases
+#  4  qNumInsert int unsigned ,    # Number of inserts in query
+#  5  qBaseInsert int unsigned ,   # Number of bases inserted in query
+#  6  tNumInsert int unsigned ,    # Number of inserts in target
+#  7  tBaseInsert int unsigned ,   # Number of bases inserted in target
+#  8  strand char(2) ,             # + or - for query strand, optionally followed by + or - for target strand
+
+#  9  qName varchar(255) ,         # Query sequence name
+
+# 10  qSize int unsigned ,         # Query sequence size
+# 11  qStart int unsigned ,        # Alignment start position in query
+# 12  qEnd int unsigned ,          # Alignment end position in query
+# 13  tName varchar(255) ,         # Target sequence name
+# 14  tSize int unsigned ,         # Target sequence size
+# 15  tStart int unsigned ,        # Alignment start position in target
+# 16  tEnd int unsigned ,          # Alignment end position in target
+# 17  blockCount int unsigned ,    # Number of blocks in alignment
+# 18  blockSizes longblob ,        # Size of each block in a comma separated list
+# 19  qStarts longblob ,      # Start of each block in query in a comma separated list
+# 20  tStarts longblob ,      # Start of each block in target in a comma separated list
+
+#Currently the program does not distinguish between matches and repMatches.  repMatches is always zero.
+# how coordinates are handled on the negative strand: In the qStart/qEnd fields the coordinates are 
+# where it matches from the point of view of the forward strand (even when the match is on the reverse strand). 
+# However on the qStarts[] list, the coordinates are reversed. 
+
+getopts('Pp:c:') || die($usage."\n");
+my $protalign=$Getopt::Std::opt_P;
+my $minqcov=$Getopt::Std::opt_c;
+my $minpid=$Getopt::Std::opt_p;
+
+#==============================================
+
+my %ctgs; # target_seqname => [$numreads, $ctglen,  $min, $max, @readlst]
+# each elem of rdlst is like this:
+#  [rdname, orientation, len, start_coord, clipL, clipR, seg_gaps,... ]
+#open (FPSL, $fpsl) || die("Error opening $fpsl file\n");
+my ($qseq, $tseq, $prevqname, $prevtname);
+my %qnums; # qryname => num_alignments
+#$tseq="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+my $lines=0;
+while (<>) {
+ next unless m/^\d+/;
+ $lines++;
+ #next if $lines>2;
+ chomp;
+ my @t=split(/\t/);
+ my $qalnlen=$t[12]-$t[11]+1;
+ my $pid=sprintf('%d', ($t[0]*100.00)/$qalnlen);
+ next if $minpid && $pid<$minpid;
+ #--
+ my ($tstart, $tend)=@t[15,16]; #should be complemented based on $t[8] and $t[14] ?
+ #--
+ my ($strand, $qryname, $qrylen, $ctgname, $ctglen)=@t[8, 9,10, 13,14];
+ my $blcount=$t[17];
+ my @blsizes=split(/\,/,$t[18]);
+ die "Error: block count doesn't match block size list!\n" unless $blcount==@blsizes;
+ my @qrystarts=split(/\,/,$t[19]);
+ die "Error: block count doesn't match block qstart list!\n" unless $blcount==@qrystarts;
+ my @tgtstarts=split(/\,/,$t[20]);
+ die "Error: block count doesn't match block tstart list!\n" unless $blcount==@tgtstarts;
+ $ctgs{$ctgname}->[0]++; #add this read to the "alignment" for this ctg
+ $ctgs{$ctgname}->[1]=$t[14];
+ my ($pmin, $pmax)=($ctgs{$ctgname}->[2], $ctgs{$ctgname}->[3]);
+ $pmin=$t[14] unless $pmin;
+ $pmax=1 unless $pmax;
+ $pmin=$tstart if ($tstart<$pmin);
+ $pmax=$tend if ($tend>$pmax);
+ $ctgs{$ctgname}->[2]=$pmin;
+ $ctgs{$ctgname}->[3]=$pmax;
+ #walk on tgt blocks and merge any blocks closer than 2bases apart
+ my ($mblcount, @mcoords ); # coords: list of [tstart, tend, qstart, qend] 
+ my $multiplier = $protalign ? 3 : 1;
+
+ my ($mtstart, $mtend, $mqstart, $mqend) = 
+    ($tgtstarts[0]+1, $tgtstarts[0]+$blsizes[0]*$multiplier, $qrystarts[0]+1, $qrystarts[0]+$blsizes[0]);
+ my $qryblsum=0;   
+ for (my $i=0;$i<$blcount-1;$i++) {
+   $qryblsum+=$blsizes[$i+1];
+   if ($tgtstarts[$i+1]-$tgtstarts[$i]-$blsizes[$i]*$multiplier <= 2*$multiplier && 
+       $qrystarts[$i+1]-$qrystarts[$i]-$blsizes[$i] <= 2) {
+     #merge with next block
+     #print STDERR "merge occured ($qryname, blocks $i + next!\n";
+     $mtend=$tgtstarts[$i+1]+$blsizes[$i+1]*$multiplier;
+     $mqend=$qrystarts[$i+1]+$blsizes[$i+1]; #print STDERR "....    mqend=$mqend ($qrystarts[$i+1])\n";
+     }
+    else { #no merge, keep the last found block and start a new block
+     push(@mcoords, [$mtstart, $mtend, $mqstart, $mqend]);
+     ($mtstart, $mtend, $mqstart, $mqend) = 
+      ($tgtstarts[$i+1]+1, $tgtstarts[$i+1]+$blsizes[$i+1]*$multiplier, $qrystarts[$i+1]+1, $qrystarts[$i+1]+$blsizes[$i+1]);
+     }
+   }
+ next if $minqcov && ($qryblsum*100.00)/$qrylen <= $minqcov;
+ push(@mcoords, [$mtstart, $mtend, $mqstart, $mqend]);
+ 
+ if ($strand=~/\-/) { 
+  $strand=$protalign?'-':'+';
+   #my @revqst;
+   #for (my $i=0;$i<$blcount;$i++) {
+   #   push(@revqst, $qrylen-($qrystarts[$i]+$blsizes[$i]));
+   #   }
+   #@qrystarts = @revqst;
+   if ($protalign) { #recalculate tgtstart coordinates
+     for (my $i=0;$i<@mcoords; $i++) {
+       ($mcoords[$i]->[0], $mcoords[$i]->[1])=
+         ($ctglen-($mcoords[$i]->[0]-1), $ctglen-($mcoords[$i]->[1]-1));
+       }
+     }
+   else { #recalculate qrystart coordinates
+     for (my $i=0;$i<@mcoords; $i++) {
+       $mcoords[$i]->[2]=$qrylen-($mcoords[$i]->[2]-1);
+       $mcoords[$i]->[3]=$qrylen-($mcoords[$i]->[3]-1);
+       }
+     }  
+   }
+  else {
+   $strand='+';
+   } 
+
+ 
+ my $qnum= ++$qnums{$qryname};
+ my $alnid="$qryname.aln$qnum";
+ if ($protalign && $strand eq '-') {
+   #swap the order of segments
+   @mcoords=reverse(@mcoords);
+   foreach my $d (@mcoords) {
+     ($$d[0], $$d[1])=($$d[1], $$d[0]);
+     ($$d[2], $$d[3])=($$d[3], $$d[2]);
+     }
+   }
+ print join("\t",$ctgname, 'psl', 'mRNA', $mcoords[0]->[0], $mcoords[-1]->[1], $pid, $strand, 
+         '.', "ID=$alnid;Name=$alnid;qlen=$qrylen;coords=$mcoords[0]->[2]-$mcoords[-1]->[3]")."\n";
+ my $en;
+ foreach my $d (@mcoords) {
+  my ($t1, $t2, $q1, $q2)=@$d;
+  $en++;
+  print join("\t",$ctgname, 'psl', 'exon', $t1, $t2, $pid, $strand, 
+         '.', "ID=$alnid.exon$en;Parent=$alnid;coords=$q1-$q2")."\n";
+  }
+print "###\n"; 
+ 
+#  if ($qryname ne $prevqname) {
+#     $qseq=&getSeq($fqry, $qryname);
+#     $prevqname=$qryname;
+#     }
+#  if ($ctgname ne $prevtname) {
+#     $tseq=&getSeq($ftgt, $ctgname);
+#     $prevtname=$ctgname;
+#     }
+ #------ parse and align the blocks
+ #print ">$qryname vs $ctgname [$strand] $blcount aln blocks ($pid\% identity):\n";
+ #for (my $i=0;$i<$blcount;$i++) {
+ #  #-- modify values for reverse $strand cases
+ #  &showBlockAlign(\$qseq, \$tseq, $strand, $qrystarts[$i], $tgtstarts[$i], $blsizes[$i]);
+ #  }
+   
+ } #while input lines
+
+
+#foreach my $ctg (keys(%ctgs)) {
+# my $d=$ctgs{$ctg};
+# print STDERR "Contig $ctg has $$d[0] reads, $$d[1] len (covered from $$d[2] to $$d[3])\n";
+# }
+
+#=============================================
+
+sub revcompl { #gets a DNA sequence, returns the reverse complement
+ my $rseq=reverse($_[0]);
+ $rseq =~ tr/AaCcTtGgUuMmRrWwSsYyKkVvHhDdBb/TtGgAaCcAaKkYyWwSsRrMmBbDdHhVv/;
+ return $rseq;
+}
+
+sub showBlockAlign {
+ my ($pseq1, $pseq2, $strand, $bstart1, $bstart2, $blen) = @_;
+ my $qseq = ($strand=~/\-/) ? revcompl(substr($$pseq1, $bstart1, $blen)) : substr($$pseq1, $bstart1, $blen);
+ printf("qry %12s: %s\ntgt %12s: %s\n-=-\n",$bstart1+1,$qseq,
+                                      $bstart2+1,substr($$pseq2, $bstart2, $blen));
+}
+

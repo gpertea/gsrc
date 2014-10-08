@@ -1,0 +1,113 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+use POSIX "sys_wait_h"; # mostly for the handy uname() function
+
+my $usage = q/Usage:
+ qsim4cc [-C] [-o <output.gff3>] [-q '<queryname>']
+            {query.fa|querydb.cidx} genomic.fa
+ Option -C forces the extraction of the CDS range of query.fa creating 
+ a file <query.fa>.cds which is then searched with sim4cc against subj.fa.
+ If <query.fa> is a multifasta file then sim4cc will be run for each of the 
+ query records.
+ The output is converted to gff and optionally appended to file <output.gff3>
+ (if -o is not given, the gff output is sent to stdout)
+ /;
+umask 0002;
+getopts('DCo:c:p:q:') || die($usage."\n");
+#die($usage."\n") unless -f $ARGV[1];
+my ($mincov, $minpid, $fappend, $qpull, $cdsOnly)=($Getopt::Std::opt_c, $Getopt::Std::opt_p,
+          $Getopt::Std::opt_o, $Getopt::Std::opt_q, $Getopt::Std::opt_C);
+my $debug=$Getopt::Std::opt_D;
+$mincov=1 unless $mincov;
+$minpid=20 unless $minpid;
+my $numaln=1; # ID suffix for each mapping
+
+my ($qf, $sfile)=@ARGV;
+die("$usage\n") unless $qf && $sfile;
+die("$usage Error: cannot locate query file ('$qf')!\n") unless -f $qf;
+die("$usage Error: cannot locate genomic fasta file ('$sfile')!\n") unless -f $sfile;
+my $host=lc((&POSIX::uname)[1]);
+chomp($host);
+($host)=($host=~m/^([\w\-]+)/);
+
+if ($qpull) { #only pull a sequence 
+  my $r=`cdbyank -a '$qpull' $qf`;
+  my ($qname, $qdesc, $qseq)=($r=~m/^>(\S+)[ \t\x01]*(.*?)[\n\r](.+)/s);
+  my @nr=split(/\x01/, $qdesc, 2);
+  $qdesc=$nr[0] if (@nr>1);
+  $qseq =~ tr/\t \n\r//d;
+  die("Error: couldn't cdbyank fasta record for $qpull from $qf!\n")
+    unless $qname && $qseq;
+  $qseq=uc($qseq);  
+  $qf=~s/\.cidx$//;
+  runSim4cc($qf, $qname, $qdesc, $qseq);
+  }
+ else { # run for each entry in $qf
+  open(QFILE, $qf) || die("Error opening query file: $qf !\n");
+  my $qcounter=0;
+  local $/="\n>";
+  while (<QFILE>) {
+    s/^>//;
+    chomp;
+    my ($qname, $qdesc, $qseq)=(m/^(\S+)[ \t\x01]*(.*?)\n(.+)/s);
+    my @nr=split(/\x01/, $qdesc, 2);
+    $qdesc=$nr[0] if (@nr>1);
+    $qseq =~ tr/\t \n\r//d;
+    $qseq=uc($qseq);
+    if ($qname && $qseq) {
+       $qcounter++;
+       runSim4cc($qf, $qname, $qdesc, $qseq, $qcounter);
+       }
+    }
+  close(QFILE);
+  }
+
+
+sub runSim4cc {
+  my ($qfile, $qname, $qdesc, $qseq, $qcnt)=@_;
+  #my $CDSextracted;
+  #my $qrf=$qfile;
+  #$qrf=$1 if $qfile=~m/\/([^\/]+)$/;
+  my $qfsim='sim4cc.'.$host.'_'.$$;
+  $qfsim.='_'.$qcnt if $qcnt;
+  my $qrf=getfname($qfile);
+  my $gfn=getfname($sfile);
+  $qfsim.='_'.$qrf.'_'.$gfn.'.qry';
+  my $cmdopts;
+  my $outseq=$qseq;
+  my ($cds_start, $cds_end);
+  if ($cdsOnly && $qdesc=~m/CDS[:=](\d+)[\-\.]+(\d+)/) {
+    ($cds_start, $cds_end)=($1,$2);
+    ($cds_start, $cds_end)=($cds_end, $cds_start) if $cds_start>$cds_end;
+    $qfsim.='.cds';
+    $outseq=substr($qseq, $cds_start-1, $cds_end-$cds_start+1);
+    #$CDSextracted=1;
+    $qdesc=~s/\s*CDS[:=]\d+\-\d+//;
+    }
+  #write sequence to a tmp file for searching
+  open(QSIM, '>'.$qfsim) || die("Error creating file '$qfsim'\n");
+  print QSIM ">$qname $qdesc\n";
+  print QSIM join("\n", (unpack('(A80)*',$outseq)))."\n";
+  close(QSIM); 
+  #debug only:  
+  #print STDERR "running: sim4cc $qfsim $sfile $cmdopts\n";
+  $cmdopts.=' A=6';
+  $cmdopts.=' >> '.$fappend if ($fappend);
+  print STDERR "sim4cc $qfsim $sfile $cmdopts\n" if $debug;
+  my $r=system("sim4cc $qfsim $sfile $cmdopts");
+  if ($r) {
+    print STDERR "Warning: Error at running: sim4cc $qfsim $sfile $cmdopts\n";
+    }
+   else { 
+    unlink($qfsim) unless $debug;
+    }
+}
+
+sub getfname {
+ my $f=$_[0];
+ $f=$1 if $f=~m/\/([^\/]+)$/;
+ $f=~s/\.cidx$//;
+ $f=~s/\.\w+$//;
+ return $f
+}

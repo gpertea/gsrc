@@ -1,0 +1,24 @@
+#!/bin/bash
+if [[ -z $1 ]]; then 
+ echo "Recursively search for text in a directory tree."
+ echo "Usage:"
+ echo " tfind [<grep options>] '<text>' ['<file_mask>']"
+ echo "Example:" 
+ echo "  tfind -i 'new panel' '*.[ch]*'"
+ exit 1
+fi
+
+fmask="${@: -1}"
+argv=("$@")
+if [[ $fmask =~ [*] ]]; then
+  #remove this argument
+  unset argv[${#argv[@]}-1]
+else
+  fmask='*'
+fi
+
+text=${argv[(${#argv[@]}-1)]}
+#echo "filemask=${fmask}"
+#echo "text=${text}"
+#(find . -name "${filemask}" | xargs grep -s "${text}" $* > /dev/tty) >& /dev/null
+find . -iname "$fmask" | xargs grep -s "${argv[@]}" "$text" 

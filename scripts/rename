@@ -1,0 +1,209 @@
+#!/usr/bin/perl -w
+use strict;
+
+# $Id: rename-perl,v 1.6 2002-02-25 17:34:14-05 roderick Exp $
+#
+# Roderick Schertler <roderick@argon.org>
+
+# Copyright (C) 2001 Roderick Schertler
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or (at
+# your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# For a copy of the GNU General Public License write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+
+use Getopt::Std qw(getopts);
+
+(my $Me = $0) =~ s-.*/--;
+my $Exit = 0;
+
+my $Usage = <<EOF;
+usage: $Me [switch]... <perl expression> [file]...
+
+  -f    overwrite existing destinations
+  -i    prompt about overwriting existing destinations
+  -l    relink rather than rename (default if invoked as relink)
+  -n    don't actually do anything (sets -v)
+  -v    print changes
+
+If no files are given newline-terminated file names are read from stdin,
+unless stdin is a terminal.
+
+Example for recursive renaming of links:
+ find . -type l -print | relink 's|^/scratch0/igm3|/scratch0/igm1|'
+EOF
+
+sub xwarn {
+    warn "$Me: ", @_, "\n";
+    $Exit ||= 1;
+}
+
+sub usage {
+    xwarn @_ if @_;
+    print STDERR $Usage;
+    exit 1;
+}
+
+sub confirm {
+    my ($src, $dest) = @_;
+    local $| = 1;
+    print "$Me: replace `$dest' with `$src'? ";
+    <STDIN> =~ /^y/i;
+}
+
+# Eval in a less related lexical scope.
+
+sub do_eval {
+    no strict;
+    eval $_[0];
+    die if $@;
+}
+
+sub main {
+    my (%opt);
+
+    my $opt_spec = 'filnv';
+    getopts $opt_spec, \%opt or usage;
+    my ($force, $interactive, $link, $no, $verbose)
+	= @opt{split /:?/, $opt_spec};
+
+    $link	= 1 if $Me eq 'relink';
+    $verbose	= 1 if $no;
+
+    @ARGV or usage "no expression specified";
+    my $op = shift @ARGV;
+
+    if (!@ARGV) {
+	usage "no files specified" if -t;
+	@ARGV = <STDIN>;
+	chomp @ARGV;
+    }
+
+    my $max_len = 0;
+    my $len = 0;
+    foreach (@ARGV) {
+    	my $link_dest;
+	if ($link) {
+	    $link_dest = $_;
+	    $_ = readlink $_;
+	    next unless defined $_;
+	}
+
+	my $was = $_;
+	do_eval $op;
+	next if $was eq $_;
+
+	if ($verbose) {
+	    my $src = $was;
+	    $src = "$link_dest -> $src" if $link;
+	    if (length($src) > $max_len) {
+		$max_len = length $src;
+		$len = $max_len + 8 - $max_len % 8;
+	    }
+	    printf "%-${len}s %s\n", $src, $_;
+	}
+
+	next if $no;
+
+	if ($link) {
+	    if (!unlink $link_dest) {
+		xwarn "unlink($link_dest): $!";
+		next;
+	    }
+	    if (!symlink $_, $link_dest) {
+		xwarn "symlink($_, $link_dest): $!";
+		next;
+	    }
+	}
+	else {
+	    if (-e $_ && !$force) {
+		if ($interactive) {
+		    next if !confirm $was, $_;
+		}
+		else {
+		    xwarn "not renaming $was, destination $_ exists";
+		    next;
+		}
+	    }
+    	    if (!rename $was, $_) {
+		xwarn "rename($was, $_): $!";
+		next;
+	    }
+	}
+    }
+
+    return 0;
+}
+
+$Exit = main || $Exit;
+$Exit = 1 if $Exit && !($Exit % 256);
+exit $Exit;
+
+__END__
+
+=head1 NAME
+
+rename-perl, relink - rename files or symlinks using Perl expressions
+
+=head1 SYNOPSIS
+
+{B<rename-perl> | B<relink>}
+[B<-f>]
+[B<-i>]
+[B<-l>]
+[B<-n>]
+[B<-v>]
+I<Perl expression>
+[I<file>]...
+
+=head1 DESCRIPTION
+
+B<rename-perl> is used to
+
+and B<relink> are used to
+
+does foo
+
+This program started with Larry Wall's B<rename> script which was
+distributed with
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<--debug>
+
+Turn debugging on.
+
+=item B<--help>
+
+Show the usage message and die.
+
+=item B<--version>
+
+Show the version number and exit.
+
+=back
+
+=head1 EXAMPLES
+
+xxx
+
+=head1 AVAILABILITY
+
+The code is licensed under the GNU GPL.  Check
+http://www.argon.org/~roderick/ for updated versions.
+
+=head1 AUTHOR
+
+Roderick Schertler <roderick@argon.org>
+
+=cut

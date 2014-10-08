@@ -1,0 +1,62 @@
+#!/usr/bin/perl
+use strict;
+use FindBin;
+
+umask 0002;
+#the line below is needed if pvmsx is used
+# also, the error condition is set only by the presence of $file 
+$ENV{'PATH'}=$FindBin::Bin.':'.$ENV{'PATH'};
+
+#so for pvmsx to consider the task was successful, $file must be deleted!
+#============== 
+# 1 is the name of the fasta sequence input file
+# 2 is the # of sequences in ${1} should = 1 for this script
+# 3 is the slice no. being processed by sx
+# 4 is 0 if not the last file, 1 if the last file
+# 5 is the # of sequences skipped initially
+# 6 is the # of sequences to be processed (-1 = ALL)
+# 7 user parameter
+#     1        2        3         4          5       6    
+my ($file, $numpass, $slice_num, $last, $skipped, $total, $prots)=@ARGV;
+#print STDERR "running: $0 ".join(' ',@ARGV)."\n";
+my $usage=q{
+Slice processing script for blat's protein-to-dnax mode;
+Never use without a parent controllers (e.g. gridx).
+Usage example: 
+  gridx -q -N -O logs -g condor -p 20 -n 2000 -i contigdb.fa blat_protdb.psx /fs/fullpath/to/proteins.fa
+}; #'
+
+die $usage."\n" unless -s $file && $total && $prots;
+my $fout=$file.'.gff3';
+
+my $log_file='log_std';
+my $err_file='err_log';
+open(STDERR, '>>'.$err_file);
+open(STDOUT, '>>'.$log_file);
+
+#my $toskip=($file =~ m/_\@(\d+)_v\d+\.\d+/) ? $1 : $skipped+$numpass*($slice_num-1);
+#my ($srvhost, $srvport)=split(/\:/,$srv);
+#$srvport=8080 unless $srvport;
+my $cmd="gblat -minScore=50 -minIdentity=70 -t=dnax -q=prot -out=gff -noHead $file $prots $fout";
+
+#my $cmd="gmap -D $dbdir -d $gmapdb -B 2 -f 1 $file > $gmap_res";
+my $slno=sprintf("slice:%09d",$slice_num);
+print STDERR ">>$slno: $cmd\n";
+&runCmd($cmd, $fout);
+
+print STDERR "<<$slno: done.\n";
+unlink($file);
+exit 0;
+
+sub runCmd {
+my ($docmd, @todel) = @_;
+my $errmsg = `($docmd) 2>&1`;
+if ($? || ($errmsg=~/ERROR/si) || ($errmsg=~/Segmentation/si) || ($errmsg=~/Failed/s) || $errmsg=~/Invalid/s) {
+  print STDERR "!Error at:\n$docmd\n";
+  print STDERR "$errmsg\n";
+  foreach (@todel) {
+    unlink($_);
+    }
+  exit(1);
+  }
+}

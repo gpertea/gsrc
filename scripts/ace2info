@@ -1,0 +1,86 @@
+#!/usr/bin/perl
+use strict;
+my $usage=q/
+ Converts ace files to the more familiar TIGR assembler info format.
+ Usage:
+  ace2info <ace_files...> 
+ Output format: 
+/;
+die $usage if $ARGV[0]=~m/\-\-?h/i;
+my $cmd='aceconv';
+
+die "Conversion program not found as '$cmd'\n" unless -x $cmd;
+
+foreach (@ARGV)  {
+ die "Error: input ace file '$_' not found.'\n" unless -e $_;
+ } 
+#=========== global data used by write_asm_info:
+my $asmno=0;
+my $asm_numseqs;
+my $asm_len;
+my @asmseqs; 
+#===================
+my $total_seqcount; #overall count of sequences assembled.
+my $total_asmcount; #overall count of sequences assembled.
+my ($seq_name,$seq_lend, $seq_rend, $asm_lend, $asm_rend);
+foreach my $ace (@ARGV) {
+ open (INCOMING, "$cmd $ace |") || die "Error opening aceconv stream!\n";
+ while (<INCOMING>) {
+  if (m/^sequence\t(\S+)/) {
+    my $seq=$1;
+    $asm_len=length($seq);
+    $asmno++;
+    $asm_numseqs=0;
+    @asmseqs=();
+    }
+   elsif (m/^seq#\t(\d+)/) {
+    $asm_numseqs=$1;
+    }
+   elsif (m/^seq_name\t(\S+)/) {
+    $seq_name=$1;
+    #this is the first in the seq_name block
+    }
+   elsif (m/^asm_lend\t(\d+)/) {
+    $asm_lend=$1;
+    }
+   elsif (m/^asm_rend\t(\d+)/) {
+    $asm_rend=$1;
+    }
+   elsif (m/^seq_lend\t(\d+)/) {
+    $seq_lend=$1;
+    }
+   elsif (m/^seq_rend\t(\d+)/) {
+    $seq_rend=$1;
+    }
+   elsif (m/^offset\t/) {
+    #end of sequence data signal
+    #---------------   0           1           2        3          4
+    push(@asmseqs, [$seq_name, $asm_lend, $asm_rend, $seq_lend, $seq_rend]);
+    }
+   elsif (m/^\|$/) {
+    #end of assembly data signal:
+    die("Invalid sequence count for asm $asmno") if scalar(@asmseqs)!=$asm_numseqs;
+    &write_asm_info();
+    }
+  }
+ close(INCOMING);
+}
+#===============================
+sub write_asm_info {
+ @asmseqs = sort { $main::a->[0] cmp $main::b->[0] } @asmseqs;
+ my $first=1;
+ # compute redundancy:
+ my $ovlsum;
+ map  { $ovlsum += $$_[2]-$$_[1]+1; } @asmseqs; 
+ my $redundancy=sprintf("%4.2f",$ovlsum/$asm_len);
+ foreach my $d (@asmseqs) {
+  if ($first) {
+     print join("\t",$asmno,$asm_len, $asm_numseqs, $redundancy);
+     $first=0;
+     }
+    else  {
+     print "\t\t\t";
+     }
+  print "\t".join("\t",@$d)."\n";
+  }
+}

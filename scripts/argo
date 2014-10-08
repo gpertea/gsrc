@@ -1,0 +1,2 @@
+#!/bin/sh
+java -Xms72m -Xmx768m -jar /opt/geo/bin/argo.jar $*

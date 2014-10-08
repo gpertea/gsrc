@@ -1,0 +1,474 @@
+#!/usr/bin/perl
+
+#some filtering can be performed on the output
+#
+# this should be rewritten in C/C++ to be faster
+
+use strict;
+
+my $usage = q{
+blast2btab [HITLEN=nn[%]] [OVHANG=nn[%]] [PID=nn] [PSIM=nn]
+ [SCORE=nnnn | E=nnnnn]
+
+Format and filter wu-blast2 output coming at stdin. The output consists of 
+the following tab delimited fields:
+0        1      2         3      4       5        
+q_name, date, q_len, method, db_file, hit_name, 
+6        7      8         9      10     11        12
+q_n5, q_n3,   hit_n5, hit_n3,   %id,   %sim,    score,
+13             14        15             16  
+file_pos1, file_pos2, hit_description, Frame, 
+ 17            18        19      [      20        21   ]
+strand,    hit_len,    E-value   [ hit-coverage  HSPs  ]
+
+Filtering:
+   PID    for minimum percent identity
+   PSIM   for minimum percent similarity
+   SCORE  for minimum alignment score   
+   E      for maximum E value (Blast E parameter)
+   HITLEN for minimum overlap length
+   OVHANG for maximum overhang length (mismatched overhangs)
+
+   If '%' is specified for HITLEN or OVHANG values, the actual cutoff
+   lengths will be computed as percentages of the query sequence length;
+
+If -topcomboX option is used, each line will represent a group, with the individual
+segment hits in the 21th field, and the actual hit coverage length as the 20th field
+};
+
+die($usage) if ($ARGV[0]=~/\-h|\-?\-help/i);
+my $_bignum=9999999;
+my %a=('HITLEN'=>0, 
+      'OVHANG'=>$_bignum, 
+      'PID'=>0,
+      'PSIM'=>0,
+      'SCORE'=>0,
+      'E'=>$_bignum,
+      'DEFLINE'=>'none',
+      'PARSE'=>0
+      );
+# try to parse filtering options, if any;
+my ($is_lenperc, $is_ovperc)=(0,0);
+my $is_filtered=0;
+my $bytes_read=0;
+foreach (@ARGV) {
+  my @param=split(/=/);
+  $is_filtered=1 if ($param[0] ne 'DEFLINE');
+  die $usage if (@param<2 || not exists($a{$param[0]}));
+  if ($param[0] eq 'HITLEN') {
+     my $p=rindex($param[1],'%');
+     if ($p>0) {
+       $is_lenperc=1;
+       $param[1]=substr($param[1],0,$p);
+       }
+     }
+   elsif ($param[0] eq 'OVHANG') {
+     my $p=rindex($param[1],'%');
+     if ($p>=0) {
+       $is_ovperc=1;
+       $param[1]=substr($param[1],0,$p);
+       }
+     }
+  $a{$param[0]}=$param[1];  
+  }
+my $defln=lc($a{'DEFLINE'});
+if ($defln eq 'none') {
+   $defln=0;
+   }
+  elsif ($defln eq 'q') {
+   $defln=1; 
+   }
+  elsif ($defln eq 'h') {
+   $defln=2;
+   }
+  elsif ($defln eq 'b') {
+   $defln=3;
+   }
+  else {
+    die "$usage. Error at DEFLINE option.";
+   }
+
+$/ = "\n";
+#$\ = "\n";
+#$, = "\t";
+my ($minhlen, $maxoh, $doparse, $minpid, $minpsim, $minscore, $maxE)=(
+       $a{'HITLEN'},
+       $a{'OVHANG'},
+       $a{'PARSE'},
+       $a{'PID'},
+       $a{'PSIM'},
+       $a{'SCORE'},
+       $a{'E'});
+$maxE='1'.$maxE if lc(substr($maxE,0,1)) eq 'e';
+
+my $writeline= ($is_filtered) ? \&write_flt : \&write_noflt;
+my $curgrp; #current group #
+my @grpdata; #when groups are defined, this accumulates HSP data
+# list of [$q5, $q3, $h5, $h3, $pid, $psim, $score, $frame]
+#my ($grphspcount, $grplen, $grpids, $grpsims); 
+#segments expected, segments collected already, 
+#  total bases, total identities, total positives
+
+#only one file is accepted here...
+my ($query, $qlen, $q5, $q3, $hit, $hitlen, $h5, $h3, $ids, $sims, $bcount, $pid, $psim, 
+    $score, $evalue, $strand, $frame, $hdefline, $searchdb, $fpos, $fend, $qdefline);
+my $flush=0;
+$fpos=-1;
+$fend=-1;
+my $method='prog';
+$searchdb='n/a';
+my @lcdate=localtime();
+my $date=($lcdate[4]+1).'/'.$lcdate[3].'/'.(1900+$lcdate[5]);
+$frame='*';
+BIGLOOP:
+while (<STDIN>) {
+  die "Line $. doesn't appear to be a blast output:\n$_\n" unless (/^(T?BLAST[NXP]?)/);
+  NEXT_QRYBLOCK:
+   $bytes_read+=length($_);
+   next if /^\s*$/;
+  
+  goto QRYFOUND if m/^Query=\s*(\S+)\s*(.*)/;
+  
+  $method=lc($1);
+  do {
+   $_=<STDIN>; $bytes_read+=length($_);
+
+   last BIGLOOP unless $_;
+   } until m/^Query=\s*(\S+)\s*(.*)/;
+  QRYFOUND: 
+  &write_group() if $query && $curgrp;
+  $query=$1;
+  $qdefline='';
+  if ($defln==1 || $defln==3) {
+     $qdefline=$2;
+     #print STDERR "qdefline set to '$qdefline'\n";
+     $qdefline =~ tr/\n//d;
+     }
+  my $linepos=$.;
+  do {
+   $_=<STDIN>;   $bytes_read+=length($_);
+   last BIGLOOP unless $_;
+   &err_parse("Cannot find 'Length' line for Query $query") 
+       if ($.-$linepos) > 10000;
+   } until /\s+\(([\d\,]+) letters/;
+  
+  $qlen=$1;
+  $qlen =~ tr/,//d;
+  # parse all matches for this $query:
+  $_=<STDIN>; $bytes_read+=length($_);
+  my $was_param;
+  while ($_ && !(($was_param=m/^Parameters:/) || m/^EXIT CODE/)) {
+     chomp;
+     if (m/^Database:\s+(\S+)/) {
+        $searchdb=$1;
+        ($searchdb)=($searchdb =~ m/([^\/]+)$/);
+        }
+     # Hit section:   
+     if (/^>(\S+)\s*(.*)/) {
+       #HSPs here
+       $hit=$1;
+       #print STDERR "hitline is: $_\n";
+       #if ($defln>=2) {
+        $hdefline=$2;
+        #print STDERR "hdefline set to '$hdefline'\n";
+       #    }
+     NEXT_SUBJ:
+       my $savepos;
+       #&err_parse("Did you use '-noseqs' option for this blast search?")
+       #       if ($hit && $score && !$h3);
+       $savepos=$.;
+       while (<STDIN>) {
+         $bytes_read+=length($_);
+         &err_parse("Cannot find 'Length' line for hit $hit") 
+            if ($.-$savepos) > 10000;
+         if (/^\s+Length\s+=\s+([\d\,]+)/) {   
+           $hitlen=$1; $hitlen =~ tr/,//d;
+           last;
+           }
+         chomp;
+         s/^\s+//;
+         $hdefline.=' '.$_ if $_;
+         }
+       $h3=0;$score=0;$strand='+';
+       $_=<STDIN>;$bytes_read+=length($_);
+       $savepos=$.+80;
+       my $withseqs=0;
+       while ($_) { 
+            #search of all HSPs until Subject match or EOF is encountered
+            #print "&&&&&& $query: found hit $hit, score=$score\n";
+            if (/^>(\S+)\s*(.*)/) {
+                #print "prevscore= $score, prevhit=$hit, prevcoords=$h3\n";
+                #&err_parse("-- coordinates not found for hit $hit. Please be sure blastn is given -noseqs option!") 
+                #   if ($hit && $score && !$h3);
+                &write_group() if $curgrp;
+                chomp;
+                $hit=$1;$hdefline=$2;
+                goto NEXT_SUBJ;
+                }
+            goto SKIP_EMPTYLN if ($_ eq "\n");
+	    if (($was_param=m/^Parameters:/) || m/^EXIT CODE/) {
+              &write_group() if $curgrp;
+              goto NEXT_QUERY;
+	      }
+            if (/^\s*Score[\s=]+(\d+)/) {
+               $score=$1;
+               $fpos=$bytes_read-length($_);
+               ($evalue)=(m/\,\s*Expect\s*=\s*([\de\.\-]+)/);
+               #print("got e-value $evalue for hit $hit \n");
+               my ($group)=(m/Group\s+=\s+(\d+)/);
+               &write_group() if ($curgrp && $curgrp!=$group);
+               $curgrp=$group;
+               $savepos=$.+80;
+               }
+             elsif (/^\s*Identities\s+=\s+(\d+)\/(\d+)\s+\(([\d\.]+)\%\)/) {
+              ($ids, $bcount, $pid)=($1,$2,$3);
+              $psim=$pid;
+              if (/Positives\s+=\s+(\d+)\/\d+\s+\(([\d\.]+)\%\)/) {
+               ($sims, $psim)=($1, $2)
+               }
+              $strand=/Minus/?'Minus':'Plus';
+              if (/Frame\s+\=\s+([\+\-\d]+)/) {
+                $frame=$1;
+                $strand=(substr($frame,0,1) eq '-') ? 'Minus':'Plus';
+                }
+              }
+             elsif (m/^Query:\s+/) { #parse query coordinates
+               if (m/^Query:\s*(\d+)[\s]+\-\s+(\d+)/) { #noseqs case
+                        ($q5,$q3)=($1,$2);
+                  $_=<STDIN>;$bytes_read+=length($_);
+                  if (m/^Sbjct:\s*(\d+)\s+\-\s+(\d+)/) { #noseqs case
+                     ($h5,$h3)=($1,$2);
+                     $fend=$bytes_read;
+                     if ($curgrp) {
+                          push(@grpdata, [$q5, $q3, $h5, $h3, $pid, $psim, $score, $frame, $ids, $sims, $bcount]);
+                          #$grphspcount++;
+                          #$grpids+=$ids;
+                          #$grpsims+=$sims;
+                          #$grplen+=$bcount;
+                        }
+                       else {
+                        &$writeline;
+                        }
+                     }
+                   else {
+                     &err_parse("Cannot find Sbjct: line for [noseqs] output (query=$query, subj=$hit)");
+                     }
+                  }
+               else { #read/parse the whole alignment to get the start-end coordinates
+                      #for both query and sequence
+                 if  (m/^Query:\s+(\d+)\s+[A-Z,\-,\*]+\s+(\d+)$/i) {
+                    ($q5,$q3)=($1,$2);
+                    }
+                  else {
+                    &err_parse("Invalid start of Query: alignment line (query=$query, subj=$hit)");
+                    }
+                 $withseqs=1;
+                 $_=<STDIN>;$bytes_read+=length($_);
+		 $_=<STDIN>;$bytes_read+=length($_);
+                 if (m/^Sbjct:\s+(\d+)\s+[A-Z,\-,\*]+\s+(\d+)$/i) {
+                    ($h5, $h3) = ($1, $2);
+                    }
+                   else {
+                    &err_parse("Cannot find start Sbjct: line for alignment (query=$query, subj=$hit)");
+                    }
+                 $_=<STDIN>; $bytes_read+=length($_);#skip empty line
+                   #$_=<STDIN>;
+                   #print STDERR "Alignment continuation is:\n$_\n\n";
+                   #exit(0);
+                 while (defined($_=<STDIN>) && m/^Query:\s+\d+\s+[A-Z,\-,\*]+\s+(\d+)$/i) {
+                   $bytes_read+=length($_);
+                   #print STDERR "found alignment continuation\n";
+                   $q3=$1;
+                   $_=<STDIN>;$bytes_read+=length($_);
+		   $_=<STDIN>;$bytes_read+=length($_);
+                   if (m/^Sbjct:\s+\d+\s+[A-Z,\-,\*]+\s+(\d+)$/i) {
+                     $h3=$1;
+                     }
+                    else {
+                      &err_parse("Cannot find end of Sbjct: line for alignment (query=$query, subj=$hit)");
+                      }
+                   $fend = $bytes_read;
+                   $_=<STDIN>;$bytes_read+=length($_);
+                   }
+                  $fend=$bytes_read;
+                  if ($curgrp) {
+                      push(@grpdata, [$q5, $q3, $h5, $h3, $pid, $psim, $score, $frame, $ids, $sims, $bcount]);
+                      #$grphspcount++;
+                      #$grpids+=$ids;
+                      #$grpsims+=$sims;
+                      #$grplen+=$bcount;
+                     }
+                    else {
+                     &$writeline;
+                     } 
+                  next; #skip to next HSP, as we might have read it
+                 } # alignment parsing 
+              }
+         SKIP_EMPTYLN:
+            $_=<STDIN>;$bytes_read+=length($_);
+            &err_parse("--Timeout trying to find all HSPs for query $query and subj $hit")
+              if ($.>$savepos+5000);
+            }
+       &err_parse("--Cannot get hit data for $hit")
+                      if ($score==0 || $h3==0);
+             
+       } #--Subject entry
+      $_=<STDIN>;$bytes_read+=length($_);
+      }
+  NEXT_QUERY:  
+    do {
+      $_=<STDIN>;$bytes_read+=length($_);
+      last if eof(STDIN);
+      #} until /^\x0C/; # record separator for multi-fasta wu-blast!
+      } until (/^Query=/);
+    goto NEXT_QRYBLOCK;  
+  }
+
+exit(0);
+
+#==========================================
+#to speed it up, use the variables directly from main program 
+#(not very elegant, but more efficient)
+
+sub err_parse {
+ die "Parsing Error at line $.:\n$_\n$_[0]\n";
+}
+
+sub write_noflt {
+  $hdefline =~ s/^>/\x01/;
+  $hdefline =~ s/ >([\w\|]{6,})/\x01$1/g;
+  my $xtra=$_[0]?"\t$_[0]":"";
+  print join("\t",
+      # 0       1      2       3         4        5     6    7   8     9    10    11
+     ($query, $date, $qlen, $method, $searchdb, $hit, $q5, $q3, $h5, $h3, $pid, $psim, 
+          #  12     13      14     15        16      17        18      19
+          $score, $fpos, $fend, $hdefline, $frame, $strand, $hitlen, $evalue))."$xtra\n";
+  }; #clean write
+  
+sub write_flt { 
+  #my ($minhlen, $maxoh, $minpid, $minsc, $maxE)
+  my ($minmatch, $maxovhang)=($is_lenperc?(($minhlen*$qlen)/100):$minhlen,
+                        $is_ovperc?(($maxoh*$qlen)/100):$maxoh);
+                        
+  my ($q_match,    $q_beg_over, $q_end_over)=($q5 < $q3)?
+     (($q3 - $q5) + 1, $q5 - 1, $qlen - $q3) :
+     (($q5 - $q3) + 1, $qlen - $q5, $q3 - 1);
+  my ($h_match, $h_beg_over, $h_end_over)= ($h5 < $h3)?
+     ( ($h3 - $h5) + 1, $h5 - 1, $hitlen - $h3) :
+     ( ($h5 - $h3) + 1, $hitlen - $h5, $h3 - 1);
+  &write_noflt($_[0])
+       if (($query ne $hit) &&
+           (($h_match >=$minmatch) || ($q_match >= $minmatch))
+           && (($q_beg_over <= $maxovhang) || ($h_beg_over <= $maxovhang))
+           && (($q_end_over <= $maxovhang) || ($h_end_over <= $maxovhang))
+           && ($pid>=$minpid)
+           && ($psim>=$minpsim)
+           && ($score>=$minscore)
+           && ($evalue<=$maxE))
+  }
+
+sub write_group {
+ die "Error: write_group called with empty \@grpdata\n"
+   if (@grpdata==0);
+ my (@q5, @q3, @h5, @h3);
+ @grpdata = sort { $main::a->[0] <=> $main::b->[0] } @grpdata;
+ my @details;
+ $score=0;
+ my $hitcov; #non redundant hit coverage --
+ my @hitsegs; # non-overlapping hit segments
+ my $frm;
+ my ($grplen, $grpids, $grpsims)=(0,0,0);
+ # also recompute $psim, $pid, $q5, $q3, $h5, $h3 
+ # because psim/pid filter may have discarded some HSPs
+ #my ($sumpid, $sumpsim, $sumlen, $minq, $maxq, $minh, $maxh);
+ foreach my $d (@grpdata) {
+  #$d=[$q5, $q3, $h5, $h3, $pid, $psim, $score, $frame, $numids, $numsims, $numbases]
+  #     0     1   2    3     4     5        6      7        8       9         10
+  #print STDERR "seg $$d[0]-$$d[1] : $$d[2]-$$d[3]\n";
+  next unless ($$d[4]>=$minpid && $$d[5]>=$minpsim);
+  $grpids += $$d[8];
+  $grpsims += $$d[9];
+  $grplen += $$d[10];
+  my ($seg_start, $seg_end)=($$d[1]<$$d[0])?($$d[1],$$d[0]) :($$d[0],$$d[1]);
+  my $seglen=$seg_end-$seg_start+1;
+  #$sumpid+=$seglen*$$d[4];
+  #$sumpsim+=$seglen*$$d[5];
+  #$sumlen+=$seglen;
+  #$minq=$seg_start if ($minq==0 || $minq>$seg_start);
+  #$maxq=$seg_end if ($maxq==0 || $maxq<$seg_end);
+
+  push(@q5,$$d[0]);push(@q3,$$d[1]);
+  push(@h5,$$d[2]);push(@h3,$$d[3]); 
+  if ($$d[2]>$$d[3]) {
+     #$minh=$$d[3] if ($minh==0 || $minh>$$d[3]);
+     #$maxh=$$d[2] if ($maxh==0 || $maxh<$$d[2]);
+     push(@hitsegs,[$$d[3],$$d[2]] )
+     }
+    else {
+     #$minh=$$d[3] if ($minh==0 || $minh>$$d[3]);
+     #$maxh=$$d[2] if ($maxh==0 || $maxh<$$d[2]);
+     push(@hitsegs,[$$d[2],$$d[3]]);
+     }
+  push(@details, "$$d[0]-$$d[1]\:$$d[2]-$$d[3]|$$d[5]");
+  $score+=$$d[6];
+  $frm=$$d[7] unless $frm;
+  $frame='*' if ($$d[7] ne $frm);
+  } #for each HSP
+ #if ($sumlen>0) {
+ # $psim=$sumpsim/$sumlen;
+ # $pid=$sumpid/$sumlen;
+ # }
+ goto GO_OUT if ($grplen==0);
+ $pid=sprintf('%d',$grpids*100/$grplen);
+ $psim=sprintf('%d',$grpsims*100/$grplen);
+
+ goto GO_OUT if ($psim<$minpsim || $pid <$minpid);
+ 
+ $hitcov=&mergeSegs(\@hitsegs);
+ 
+ #@q5 = sort { $main::a <=> $main::b } @q5;
+ #@q3 = sort { $main::a <=> $main::b } @q3;
+ #@h5 = sort { $main::a <=> $main::b } @h5;
+ #@h3 = sort { $main::a <=> $main::b } @h3;
+ #determine actual (non-overlapping) coverage of the hit
+ ($q5, $q3, $h5, $h3)=($q5[0], $q3[-1], $h5[0], $h3[-1]);
+ if ($strand eq 'Minus' && ($q5[0]>$q3[0])) { # q5>q3 unless protein search
+   ($q5, $q3, $h5, $h3)=($q5[-1], $q3[0], $h5[0], $h3[-1]);
+   @details=reverse(@details);
+   }
+   
+ &$writeline("$hitcov\t".join('~',@details));
+ #-- clear
+GO_OUT:
+ @grpdata=();
+ undef($curgrp);
+ #$grplen=0;$grpids=0;$grpsims=0;$grphspcount=0;
+}
+
+sub mergeSegs {
+ my $a=shift; # ref to list of [h5, h3]
+ my $hcov=0;
+ OVLCHECK:
+ for (my $i=0;$i<(@$a-1); $i++) {
+  for (my $j=$i+1;$j<@$a; $j++) {
+    my ($li, $ri, $lj, $rj)=
+        ($$a[$i]->[0], $$a[$i]->[1], $$a[$j]->[0], $$a[$j]->[1]);
+    if ($lj<=$ri && $lj>=$li) {
+      $$a[$i]->[0]=$li;
+      $$a[$i]->[1]=($rj>$ri) ? $rj : $ri;
+      splice(@$a, $j,1);
+      goto OVLCHECK;
+      }
+    elsif ($li<=$rj && $li>=$lj) {
+      $$a[$i]->[0]=$lj;
+      $$a[$i]->[1]=($rj>$ri) ? $rj : $ri;
+      splice(@$a, $j,1);
+      goto OVLCHECK;
+      }
+    } # for j
+  } # for i
+ foreach my $d (@$a) {
+  $hcov+=($$d[1]-$$d[0]+1);
+  }
+ return $hcov;
+}

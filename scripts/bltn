@@ -1,0 +1,30 @@
+#!/bin/tcsh -f
+
+if ($2'x' == 'x') then
+ echo "Usage: \n bltn qryseq(s).fasta dbseq.fasta [x|p]"
+ echo "dbseq.fasta must be a nucleotide sequence."
+ echo "The 3rd parameter can be:"
+ echo "    x - to use tblastx instead of blastn"
+ echo "    p - if qry is protein (tblastn)"
+ exit 1
+endif
+
+set fqry=$1
+shift
+set fdb=$1
+shift
+set qparams='-q=rna -t=dna'
+if ($1 == 'x') then
+  set qparams='-q=dnax -t=dnax'
+  else
+ if ($1 == 'p') then
+   set qparams='-q=prot -t=dnax'
+   endif
+endif
+
+if (-f $fqry && -f $fdb) then
+ echo "# running: gblat $qparams -out=gff $fdb $fqry stdout"
+ gblat -noHead $qparams -out=gff $fdb $fqry stdout
+ else
+echo "$fqry or $fdb not found!"
+endif

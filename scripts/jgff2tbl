@@ -1,0 +1,709 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+use FindBin;use lib $FindBin::Bin;
+use dbSession;
+
+my $usage = q/Usage:
+ jgff2tbl -f <fasta_file> [-a <acc2version_table>] [-A] [-N] [-t <track>] 
+    [-o <out_prefix>] [-c 'organism_code'] [-n '<organism_name>'] <gff_file>
+
+ Default <track> used for features is 'jigsaw'.
+
+ Creates a .fsa and .tbl files to be used by tbl2asn
+ 
+/;
+umask 0002;
+getopts('NDn:c:Aa:f:t:o:') || die($usage."\n");
+my %stop=('TAA'=>1,'TAG'=>1,'TGA'=>1, 'TAR'=>1,'TRA'=>1);
+
+my $fastafile=$Getopt::Std::opt_f || die("$usage A fasta file is required!\n");
+my $defpre=$fastafile;
+if ($defpre=~m/[\/\\]([\.\,\; \(\)\$\~\-\w]+)$/) {
+ $defpre=$1; #remove path components
+ }
+($defpre)=($defpre=~m/^(\w+)/);#keep only the base part of the file name
+my $nodb=$Getopt::Std::opt_N;
+my @tbl;
+my $orgcode=$Getopt::Std::opt_c;
+my $debug=$Getopt::Std::opt_D;
+unless ($orgcode) { 
+ ($orgcode)=($defpre=~m/([a-z,_]+)\d+$/i);
+ $orgcode=~tr/-_//d;
+ $orgcode=uc($orgcode);
+ $orgcode='BB' if $orgcode eq 'BS';
+ }
+my $accfile=$Getopt::Std::opt_a;
+my $accparse=$Getopt::Std::opt_A;
+
+my $outprefix=$Getopt::Std::opt_o || $defpre;
+my $orgname=$Getopt::Std::opt_n;
+my $track=$Getopt::Std::opt_t || 'jigsaw';
+# die("$usage A feature track must be specified!\n");
+my $gff=shift(@ARGV) || die("$usage An input gff3 file must be given!\n");
+die("$gff: nothing to do.") if (-e $gff && (-s $gff<10));
+my %acc;
+if ($accfile) {
+ open(ACCFILE, $accfile) || die ("Error opening $accfile!\n");
+ chomp;
+ while (<ACCFILE>) {
+  my @a=split;
+  $acc{$a[0]}=$a[1];
+  }
+ close(ACCFILE);
+}
+open(FSA, '>'.$outprefix.'.fsa') 
+  || die ("Error creating file $outprefix.fsa !\n");
+
+open(FA, $fastafile)||die("Error opening $fastafile !\n");
+my ($seqid, $seqlen, $ntseq, $encname);
+while (<FA>) {
+ if (m/^>(\S+)\s*(.*)/) {
+   last if $seqid;#only one sequence !
+   ($seqid, my $rest)=($1, $2);
+   if ($accfile) {
+     my $accver=$acc{$seqid};
+     $seqid=$accver if $accver;
+     }
+   my ($enc)=($rest=~m/EN([mr]\d+)/);
+   if ($enc) {
+     $encname='EN'.$enc;
+     $orgcode.='_'.$enc 
+     }
+   if ($accparse) {
+     my ($short, $acc)=split(/\|/,$seqid);
+     $acc=$short unless $acc;
+     if ($acc=~m/(\w+)v(\d+)$/) {
+       $seqid=$1.'.'.$2;
+       }
+     }
+   print FSA '>'.$seqid;
+   print FSA " [organism=$orgname]" if $orgname;
+   print FSA " [gcode=1] [primary=$seqid] $rest\n";
+   next;
+   } 
+ print FSA $_;
+ tr/\n\r\t //d;
+ $ntseq.=uc($_); # for large sequences, better write this into a memory mappable file
+ $seqlen+=length($_);
+}
+close(FSA);
+
+open(GFF, $gff) || die("Error opening the input gff file: $gff !\n");
+#print FTBL join("\t", '', '', '','note', $credits)."\n";
+
+my %gn; #unique gene names
+{
+my $cparent; #current parent - ASSUMES lines are ordered properly (children following parent)
+my $cf; #current parent feature name (e.g. 'mRNA' or 'gene')
+my $cxf; # child feature type: 'exon' or 'CDS'
+
+my $cstrand;
+my ($cstart, $cend);
+#TODO: also use @ex for mRNA fkey (when UTRs are available)
+my @cx;      #children intervals
+my ($cdescr, $gene_name, $mcov, $pxgap, $pnostart, $pnostop, $qxgap);
+while (<GFF>) {
+ next if m/^\s*#/;
+ chomp;
+ my ($chr, $ftrack, $f, $fstart, $fend, $fscore, $strand, $frame, $attrs)=split(/\t/);
+ next unless lc($track) eq lc($ftrack);
+ ($fstart, $fend)=($fend, $fstart) if $fend<$fstart;
+ $f='exon' if ($f =~m/\-exon$/);
+ my ($fid)=($attrs=~m/ID\s*=\s*"?([^;"]+)/);
+ my ($fp)=($attrs=~m/Parent\s*=\s*"?([^;"]+)/);
+ unless ($fid || $fp) {
+   print STDERR "Warning ($defpre, $encname): feature line $_ has neither ID nor Parent! skipping..\n";
+   next;
+   }
+ if ($fp) { #child feature ('exon' or 'CDS')
+   if ($cparent && $cparent ne $fp) {
+     die("Error ($defpre): invalid order of input lines (unknown parent $fp while still processing $cparent\n$_\n");
+     }
+   if ($cxf && $cxf ne $f) {
+     # TODO: will permit both 'exon' and 'CDS' subfeatures later
+     die("Error ($defpre): multiple subfeatures are not accepted (parent $fp, $cf has subfeature $cxf already)\n");
+     }
+   $cxf=$f;
+   my ($mevcount)=($attrs=~m/mappingEvCount=(\d+)/i);
+   #             0       1      2           3
+   push(@cx, [$fstart, $fend, $frame, $mevcount]);
+   }
+ else { #parent (mRNA) line
+   if ($cparent ne $fid) {
+      storeFeature($cparent, $cstrand, $cstart, $cend, $cdescr, $mcov,
+              $gene_name, [@cx], $pxgap, $pnostart, $pnostop, $qxgap) if @cx>0;
+      $cparent=$fid;
+      $cstrand=$strand;
+      $cf=$f;
+      $cxf='';
+      ($cstart, $cend)=($fstart, $fend);
+      @cx=();
+      $cdescr='';
+      ($pxgap, $pnostart, $pnostop, $qxgap)=();
+      }
+     else {
+      die("Error ($defpre): duplicate parent entry for $fid\n");
+      }
+     # try to parse the description/annotation, if any
+     ($mcov)=($attrs=~m/MCov=([\d\.]+)/i);
+     ($gene_name)=($attrs=~m/GeneId=([^\;]+)/i);
+     $gene_name=uc($gene_name);
+     ($pxgap)=($attrs=~m/ExonGap=(\d+:\d+)/i);
+     ($qxgap)=($attrs=~m/QXGap=([\d+\-\,]+)/i);
+     $pnostart=1 if $attrs=~m/noStart/i;
+     $pnostop=1 if $attrs=~m/noStop/i;
+     if ($attrs=~m/TopHit\s*=\s*"?([^;"]+)/i) {
+          $cdescr=$1;
+          }
+         elsif ($attrs=~m/descr\s*=\s*"?([^;"]+)/i) {
+          $cdescr=$1;
+          }
+         elsif ($attrs=~m/Info\s*=\s*"?([^;"]+)/i) {
+          $cdescr=$1;
+          }
+         elsif ($attrs=~m/BestHit\s*=\s*"?([^;"]+)/i) {
+          $cdescr=$1;
+          }
+         elsif ($attrs=~m/Name\s*=\s*"?([^;"]+)/) {
+          $cdescr=$1;
+          }
+     if ($cdescr) {
+       $cdescr=~s/^\s+//;$cdescr=~s/\s+$//;
+       $cdescr='' if index(lc($fid),lc($cdescr))>=0;
+       $cdescr=~s/\x01.+//;
+       }
+   } #parent
+  
+ }
+
+storeFeature($cparent, $cstrand, $cstart, $cend, $cdescr, $mcov,
+             $gene_name,  [@cx], $pxgap, $pnostart, $pnostop, $qxgap) if @cx>0;
+} #input parsing block
+close(GFF);
+
+my ($ds, $sth);
+my $sql='select xref_data from uniprot_xref where xrefdb in ("GenBank", "EMBL") '.
+                  'and xref_data not like "NOT_ANNOTATED%" and up_id=?';
+
+unless ($nodb) {
+# $ds = dbSession->new('geanno@NEOSYBASE');
+#$ds = dbSession->new('common@EVERGREEN');
+$ds = dbSession->new('common@CBCBMYSQL');
+$sth=$ds->prep($sql);
+}
+my %gdup;
+
+
+open(FTBL, '>'.$outprefix.'.tbl') 
+  || die("Error creating $outprefix.tbl file!\n");
+open(GFFOUT, ">$outprefix.tbl.gff3") 
+   || die("Error creating $outprefix.tbl.gff3 file!\n");
+print FTBL ">Feature\t$seqid\n";
+#print FTBL join("\t", 1, $seqlen, 'misc_feature')."\n";
+my $credits='Predicted annotation generated by JIGSAW and other methods, and provided'.
+' by Geo Pertea, Mihaela Pertea, Jonathan Allen and Steven Salzberg, Center for'.
+' Bioinformatics and Computational Biology, University of Maryland';
+
+
+# -- write sequencing gaps track to gff file;
+#---
+ my @sgaps=getSequencingGaps();
+ my $sgnum=0;
+ foreach my $d (@sgaps) {
+   $sgnum++;
+   print GFFOUT join("\t", $seqid, 'seqgap', 'gap', $d->[0], $d->[1], '.', '+',
+                         '.', "ID=Seqgap_$sgnum;Name=Seqgap_$sgnum\n");
+ }
+
+my $re;
+$re = qr/\s*\(([^\)\(]+|(??{$re}))+\)/x;
+
+foreach my $t (@tbl) {
+ writeFeature($t);
+ }
+
+close(FTBL);
+close(GFFOUT);
+
+if ($sth) {
+ $sth->finish();
+ $ds->logout();
+ }
+
+
+sub storeFeature {
+  my ($cparent, $cstrand, $cstart, $cend, $cdescr, $mcov,               
+              $gene_name, $cxref, $xgap, $nostart, $nostop, $qgap)=@_;
+  $cparent=~tr/.,:/___/s;
+  
+  unless($mcov>50 && $cdescr) {
+    $gene_name='';
+    }
+  $gn{$gene_name}++ if $gene_name;  
+  push(@tbl, [$cparent, $cstrand, $cstart, $cend, $cdescr, $mcov,
+               
+              $gene_name, $cxref, $xgap, $nostart, $nostop, $qgap]),
+}
+
+sub writeFeature {
+  my $d=$_[0];
+  my ($parent, $gstrand, $gstart, $gend, $gdescr, $acov, $gname, $ex, 
+                                $xgap, $nostart, $nostop, $qgap)=@$d;
+  print STDERR "writeFeature($parent, $gdescr, $gname)..\n" if $debug;
+  my @cx= sort { $main::a->[0]<=>$main::b->[0] } @$ex;
+  my @gffx = @cx;
+  #if ($gstrand eq '-') { #reverse complement features
+  #   ($gstart, $gend)=($gend, $gstart);
+  #   @cx = map { $_=[$_->[1], $_->[0], $_->[2]] } @cx;
+  #   @cx= reverse(@cx);
+  #   }
+ my $s="\t";
+ my $cid='';
+ my $infrsim;
+ my $unipr=0;
+ if ($gdescr) {
+   my $hdescr;
+   ($cid, $hdescr)=split(/ /,$gdescr,2);
+   $gdescr=$hdescr if $hdescr;
+   $gdescr=~s/^gid:\S+\s+//;
+   $gdescr=~s/^CDS:\d+\-\d+\s+//;
+   $gdescr=~s/^CDS:join\([\d\,\-]+\)\s+//;
+   $gdescr=~s/UniRef100_\S+\s+//;
+   if ($cid=~m/^UPr?\|(\w+)\|acc\|(\w+)/) {
+     $unipr=1;
+     my ($upid, $upacc)=($1,$2);
+     $cid=up2gb($upid);
+     if ($cid) {
+      $infrsim='AA sequence:INSD:'.$cid;
+      $cid.=' ';
+      }
+     else { #no native GB entry, use SwissProt accession
+      $infrsim='AA sequence:SP:'.$upacc;
+      $cid=$upacc;
+      $cid.=' ';
+      }
+     }
+    elsif ($cid=~m/[modinfpxvr]+\|([\w\.]+)/) { #refseq entry
+     $cid=$1;
+     $cid =~ s/\.[24a-z]+\d+$//;
+     my $refacc=$cid;
+     $refacc.='.1' unless $refacc=~m/\.\d+$/;
+     $infrsim='RNA sequence:RefSeq:'.$refacc;
+     $cid.=' ';
+     }
+    else {
+     $cid='';
+     } 
+   }
+ ##print FTBL join($s, '', '', '','locus_tag', $parent)."\n";
+ my $note;
+ my $product='hypothetical mRNA';
+ #my $product='hypothetical protein';
+ my $prot_desc;
+ my $cdsproduct='hypothetical protein';
+ my $gproduct=''; 
+ my $gffnote='';
+ if ($gdescr) {
+  #print STDERR " re processing start ($gdescr)..\n" if $debug;
+  # my ($fp)=($gdescr=~m/($re)/); #first note within parentheses
+  #print STDERR "  re m/ processing end.\n" if $debug;
+  # $fp=~s/^\s*\(\s*//;
+  # $fp=~s/\s*\)\s*$//;
+  $gdescr=~tr/[]/()/;
+  $gdescr=~s/$re//g; #remove all parenthetical constructs
+  $gdescr=~tr/ / /s; #squash duplicated spaces
+  if ($acov>50) {
+    my $d=$gdescr; 
+    $d=~s/UniRef100_\S+\s+//;
+    my $species;
+    #remove organism name
+    $species=$1 if ($d=~s/\s+\{([ \.\,\-\"\'\w]+)\}$//);
+    # is the product provided?
+    if ($d=~/\bproduct:\s*(\S[^\:\{\;]+)/i) {
+      my $v=$1;
+      if ($v=~m/\bhypothetical\b/ || $v=~m/\bLOC\d+/ || $v=~m/\bRIKEN\b/) {
+         $d=~s/\s*product:[^\:\{;]+//;
+         }
+        else { $d=$v; }
+      }
+    # make words start with lowercase: (proper names will mess this up)
+    $d =~ s/([A-Z][a-z]{5,})\b/\L$1/g;
+    #-- remove/convert isoform info from product descriptions
+    $d=~s/(?:transcript|splice)\s+variant\s+([\w\.\-\;]{1,5})$/isoform $1/i;
+    $d=~s/\,?\s*full insert(?: sequence)//i;
+    $d=~s/\,?\s*full (?:insert|sequence)//i;
+    $d=~s/\,?\s*\bform\d+//i;
+    $d=~s/phosphorylase\, glycogen[\;\.]\s*muscle/muscle glycogen phosphorylase/i;
+    $d=~s/^\s+//;$d=~s/[\;\:\,\. ]*$//;
+    if ($d=~s/^\s*similar\s+(to|with)\s+//i) {
+      $d=~s/homolog\w*$//i;
+      $d.=' homolog';
+      }
+    $note='similar to '.$cid.$d;
+    $note.=' ('.$species.')' if $species;
+    $gffnote=$note.", $acov\% coverage";
+    $d=~s/\s*\bLOC\d+//;
+    # $d=~s/\s*\bproduct\b//i;
+    # $d=~s/\s*\bC[\dxy]+orf\d+//i;
+    if ($d =~m/\bhypothetical\b/ || $d=~m/_predicted\b/i || $d=~m/\bRIKEN\b/ || $d=~m/\d+RIK\b/i 
+           || $d=~m/predicted gene/i || $d=~m/open reading frame\s+\d+/i || $d=~m/uncharacterized/i 
+           || $d=~m/with sequence similarity/i || $d=~m/conserved gene/i
+           || $d=~m/on chr/i || $d=~m/\bchromosome\b/i || $d=~m/\s*\bC[\dxy]+orf\d+/i
+           || $d=~m/\b[xy\d]+[pq]\d+\b/i  || $d=~m/telomeric to/i || $d=~m/neighbor (?:of|to)/i
+           || $d=~m/^\s*(?:protein|product)\s*$/i
+           || ($unipr && $d=~m/^[A-Z]+\d{9,}$/)
+           ) {
+       $d='';
+       }
+     else {
+      $d=~s/\,?\s*nuclear gene encoding mitochondrial protein//i;
+      $d=~s/^\s+//;$d=~s/[\;\:\,\. ]*$//;
+      $d=~s/\,?\s*\d+\s*kDa\b//i;
+      $d=~s/gene$/protein/;
+      $d=~tr/ / /s;
+      if ($d) {
+        $product=$d.' (predicted)'; #unless $d =~ m/hypothetical/;
+        $cdsproduct=$product;
+        }
+      }
+    $gname='' unless $d; 
+    $gname='' if ($gname=~m/LOC\d+/ || $gname=~m/\s*\bC[\dxy]+orf\d+/i || $gname=~m/\d+RIK$/i);
+    }
+   else {
+    $gname='';
+    }
+  }
+ my $lpid; #local protein id
+ my $cdsnote;
+ if ($gname) {
+   if ($gn{$gname}>1) {
+     my $gnum = ++$gdup{$gname};
+     $gname=~s/[ \-_]?predicted$//i;
+     $cdsnote='distinct genes were predicted for gene locus '.$gname;
+     $gname.='_'.$gnum;
+     }
+   $gname=~s/[ \-_]?predicted$//i;
+   $lpid=$orgcode.'_'.$gname;
+   }
+  else {
+   my $jname=$parent;
+   $jname=~tr/_//d;
+   $jname=~s/tjsm/jsm/;
+   $lpid=$orgcode.'_jsm'.uc(sprintf('%x',$gstart)).($gstrand eq '+' ? 'f':'r');
+   $gname=$lpid;
+   }
+  
+ my @xsplit=( 0 );
+ #--
+ $gffnote = $product unless $gffnote;
+ print GFFOUT join("\t", $seqid, 'jigsaw', 'mRNA', $gffx[0]->[0], $gffx[-1]->[1], '.', 
+                       $gstrand, '.', "ID=$parent;Name=$gname;descr=\"$gffnote\"\n");
+ foreach my $gex (@gffx) {
+   print GFFOUT join("\t", $seqid, 'jigsaw', 'CDS', $gex->[0], $gex->[1], '.', 
+                       $gstrand, $gex->[2], "Parent=$parent\n");
+   if ($gex->[3]==0) {
+     print STDERR "Warning ($defpre, $encname): no mapping evidence for exon $$gex[0]-$$gex[1] of $parent|$gname;\n";
+     }
+   }
+ #--
+ my $stopErr="ERROR ($defpre): in-frame stop codon found for $parent|$gname ($product)\n";
+ my $revstrand=($gstrand eq '-');
+ my $lastCodon='';
+ if ($xgap) { # exon gap found
+    my ($splstart, $splend)=split(/:/,$xgap);
+    my @sa = grep { $_->[0]<=$splstart } @cx; #lower part, affected by gap
+    @sa= map { [ @$_ ] } @sa; #convert @sa into a copy, not references to exon data
+    #print STDERR "lower half: ".join(',', ( map { $_->[0]."-".$_->[1] } @sa ))."\n";
+    #print STDERR "$sa[-1]->[1]  vs $splend \n";
+    if ($sa[-1]->[1]>=$splstart) {
+       $sa[-1]->[1]=$splstart-1; # frame will be fixed later?
+       }
+    my @sb = grep { $_->[1]>=$splend } @cx; #upper half
+    @sb= map { [ @$_ ] } @sb;
+    #print STDERR "upper half: ".join(',', ( map { $_->[0]."-".$_->[1] } @sb ))."\n";
+
+    my @sbr= map { $_->[0].'-'.$_->[1] } @sb; 
+    if ($sb[0]->[0]<$splend) {
+       $sb[0]->[0]=$splend+1;
+       }
+    my @cxr= map { $_->[0].'-'.$_->[1] } @cx;
+    
+    if ($sa[-1]->[1]-$sa[0]->[0]<8) { # too short a fragment
+      @cx=@sb;
+      $xgap='';
+      $gstart=$sb[0]->[0];
+      print STDERR "WARNING: dropping short split end $sa[-1]->[1]-$sa[0]->[0] of $parent|$gname\n";
+      goto SHORT_SPLIT;
+      }
+    if ($sb[-1]->[1]-$sb[0]->[0]<8) {
+      @cx=@sa;
+      $xgap='';
+      $gend=$sa[-1]->[1];
+      print STDERR "WARNING: dropping too short split end $sb[-1]->[1]-$sb[0]->[0] of $parent|$gname\n" if $sb[-1]->[1];
+      goto SHORT_SPLIT;
+      }
+    @xsplit=();
+    my $frameCheck=0;
+    if ($revstrand) {
+      @cx = map { $_=[$_->[1], $_->[0], $_->[2]] } @cx;
+      @cx= reverse(@cx);
+      @sa = map { $_=[$_->[1], $_->[0], $_->[2]] } @sa;
+      @sa= reverse(@sa);
+      @sb = map { $_=[$_->[1], $_->[0], $_->[2]] } @sb;
+      @sb= reverse(@sb);
+      #print STDERR "checking Frame for \@sa, stops for \@b\n";
+      $frameCheck=&checkFrame(\@sa, 1, \$lastCodon); # this will also "fix" the frame if needed
+      print STDERR $stopErr if &checkStop(\@sb, 1);
+      push(@xsplit, [[@sb], '_5p',', 5 prime'],[[@sa], '_3p',', 3 prime']);
+      }
+     else { #forward strand
+      $frameCheck=&checkFrame(\@sb,0,\$lastCodon);
+      print STDERR $stopErr if &checkStop(\@sa);
+      push(@xsplit, [[@sa], '_5p',', 5 prime'],[[@sb], '_3p',', 3 prime']);
+      }
+    if ($frameCheck==0) {
+     print STDERR "ERROR ($defpre): in-frame stop found for $parent|$gname ($product) and frame shift fix failed.\n";
+     }
+   } 
+   else { #no intra-exon gaps detected (no split)
+    SHORT_SPLIT:
+    if ($revstrand) { 
+      @cx = map { $_=[$_->[1], $_->[0], $_->[2]] } @cx;
+      @cx= reverse(@cx);
+      }
+    print STDERR $stopErr if &checkStop(\@cx, $revstrand, \$lastCodon);
+   }
+  #-------------- gene ---------------------
+  my @hasNs = checkNs($gstart, $gend);
+  if (@hasNs>0 || $qgap) {
+    my $wmsg="Warning ($defpre, $encname): possible gap in model $parent|$gname : ";
+    my @ev;
+    push(@ev, "sequencing gap at ".join(',',@hasNs)) if @hasNs>0;
+    push(@ev, "mapping-suggested gaps at $qgap") if $qgap;
+    $wmsg.=join("; ",@ev); 
+    print STDERR $wmsg."\n";
+    }
+  if ($revstrand) { #reverse complement features
+    ($gstart, $gend)=($gend, $gstart);
+    }
+  print FTBL join($s, '<'.$gstart, '>'.$gend, 'gene')."\n";
+  print FTBL join($s, '', '', '','gene', $gname)."\n";
+  my $jspredline=join($s,'','','','inference','ab initio prediction:JIGSAW:3.2')."\n";
+  print FTBL $jspredline;
+  if ($infrsim) {
+  print FTBL join($s,'','','','inference','similar to '.$infrsim)."\n";
+  }
+  #---  
+   
+ $nostop=1 unless $stop{uc($lastCodon)};
+ foreach my $xspl (@xsplit) {
+    #
+    # ------------- mRNA --------------------
+    my ($cdspl_id, $cdspl_prod, $cdspl_note)=('','','');
+    my ($part5, $part3)=($nostart, $nostop); #partial at 5' and/or at 3'
+    
+    if ($xspl) { # if we have split data
+     @cx=@{$xspl->[0]};
+     $cdspl_id=$xspl->[1]; # '_a' or '_b'
+     $cdspl_prod=$xspl->[2]; # ", 5 prime" or ", 3 prime"
+     $cdspl_note='; sequencing gap found within coding sequence';
+     $part5=1 if index($cdspl_prod, '3')>0;
+     $part3=1 if index($cdspl_prod, '5')>0;
+     }
+    my $endrna= $cx[-1]->[1];
+    $cx[-1]->[1]='>'.$endrna;
+    print FTBL join($s, '<'.$cx[0]->[0], $cx[0]->[1], 'mRNA')."\n";
+    my @crx=@cx;shift(@crx);
+    foreach my $xc (@crx) {
+     print FTBL join($s, $$xc[0], $$xc[1])."\n";
+     }
+    print FTBL $jspredline;
+    if ($infrsim) {
+     print FTBL join($s,'','','','inference','similar to '.$infrsim)."\n";
+     }
+    print FTBL join($s, '', '', '','product', $product.$cdspl_prod)."\n";
+
+    #-------------- CDS --------------------- 
+    $cx[-1]->[1]=$endrna;
+    my $cdstart=$cx[0]->[2]+1;
+    #@cx is sorted such that $cx[0] is always the 5' exon
+    $cx[0]->[0]='<'.$cx[0]->[0] if $part5;
+    $cx[-1]->[1]='>'.$cx[-1]->[1] if $part3;
+    print FTBL join($s, $cx[0]->[0], $cx[0]->[1], 'CDS')."\n";
+    @crx=@cx;shift(@crx);
+    foreach my $xc (@crx) {
+     print FTBL join($s, $$xc[0], $$xc[1])."\n";
+     }
+    print FTBL $jspredline; 
+    if ($infrsim) {
+     print FTBL join($s,'','','','inference','similar to '.$infrsim)."\n";
+     }
+
+    print FTBL join($s, '', '', '','codon_start', $cdstart)."\n" if $cdstart>1 || $part5 || $part3;
+    print FTBL join($s, '', '', '','protein_id', 'gnl|NISC-CON|'.$lpid.$cdspl_id)."\n";
+    print FTBL join($s, '', '', '','product', $cdsproduct.$cdspl_prod)."\n";
+    print FTBL join($s, '', '', '','prot_desc', $prot_desc)."\n" if ($prot_desc);
+    my $cnote=$note;
+    if ($cdsnote) {
+      $cnote=$note ? $note.'; '.$cdsnote : $cdsnote;
+      }
+    print FTBL join($s, '', '', '','note', $cnote.$cdspl_note)."\n" if $cnote;
+  } # - for each gap split -------------
+
+ print STDERR " => done $gname\n" if $debug;
+}
+
+sub checkFrame {
+ #return 1;
+ my ($rx, $rev, $rlastc)=@_; # $rx = [ [$exonstart, $exonend, $frame], ... ]
+ my ($s, $f);
+ my @xrange= map { $_->[0].'-'.$_->[1] } @$rx;
+ #print STDERR "Checking FRAME for exons: ".join(',',@xrange)."\n";
+
+ # print STDERR "checking frame for ".scalar(@$rx). " exons..\n";
+ if ($rev) {
+   map { $s.=substr($ntseq, $_->[1]-1, $_->[0]-$_->[1]+1) } (reverse(@$rx));
+   $s=reverseComplement($s);
+   # $f=$$rx[-1]->[2];
+   }
+  else {
+   map { $s.=substr($ntseq, $_->[0]-1, $_->[1]-$_->[0]+1) } @$rx;
+   #first check if the given frame is OK
+   }
+ # print STDERR join("\n", unpack("(A80)*",$s))."\n";
+ my %fr=( 0=>1, 1=>1, 2=>1 );
+ my @frames; # frames to try, in the order of priority:
+ # 1st the frame that would cover the end precisely
+ 
+ push(@frames,length($s)%3);
+ delete $fr{$frames[0]};
+ 
+ # 2nd - is the originally declared frame 
+ $f=$$rx[0]->[2];
+ $f=0 unless $f>0;
+ if ($f!=$frames[0]) {
+    push(@frames, $f);
+    delete $fr{$f};
+    }
+ #add the rest of the frames to check
+ my @frest=keys(%fr);
+ push(@frames, @frest);
+
+ my ($stopfound, $newf);
+ my %lastcodon; # last codons in each frame
+ foreach my $frame (@frames) {
+   # print STDERR ".. trying frame $frame\n";
+   my @c=unpack('A'.$frame.'(A3)*',$s);
+   shift(@c);$lastcodon{$frame}=pop(@c);
+   $stopfound=0;
+   foreach my $codon (@c) { 
+     if ($stop{$codon}) {
+         $stopfound=1;    
+        # print STDERR "    STOP found.\n";
+         last;
+         }
+       }
+   $newf=$frame;
+   last unless $stopfound;
+   }
+ return 0 if ($stopfound); # Error: cannot find a "clean" frame!
+ #-- new frame suggested
+ $$rx[0]->[2]=$newf;
+ $$rlastc=$lastcodon{$newf} if $rlastc;
+ return 1;
+}
+
+sub checkNs {
+ my ($gs, $ge)=@_;
+ if ($ge<$gs) {
+  print STDERR "Warning ($defpre, $encname): genestart>geneend coordinates!\n";
+  ($ge,$gs)=($gs,$ge);
+  }
+ my $gseq=substr($ntseq, $gs-1, $ge-$gs+1);
+ my @sgaps;
+ my $from=0;
+ my $r;
+ my @nregs=($gseq=~m/(N{2,})/g);
+ my $ni=0;
+ while (($r=index($gseq, 'NN',$from))>=0) {
+   $from=$r+length($nregs[$ni]);
+   push(@sgaps, ($gs+$r).'-'.($gs+$from-1));
+   $ni++;
+   }
+ return @sgaps;  
+}
+
+sub getSequencingGaps {
+ my @res;
+ my @nregs=($ntseq=~m/(N{2,})/g);
+ my $from=0;
+ my $r;
+ my $ni=0; 
+ while (($r=index($ntseq, 'NN',$from))>=0) {
+   $from=$r+length($nregs[$ni]);
+   push(@res, [$r+1, $from]);
+   $ni++;
+   }
+ return @res;
+}
+
+sub checkStop {
+ my ($rx, $rev, $rlastc)=@_; # ref to list of [$exonstart, $exonend, $frame]
+ #my @xrange= map { $_->[0].'-'.$_->[1] } @$rx;
+ #print STDERR "..checking ".join(',',@xrange)." for stop codons..\n";
+ my ($s, $f);
+ if ($rev) {
+   map { $s.=substr($ntseq, $_->[1]-1, $_->[0]-$_->[1]+1) } (reverse(@$rx));
+   $s=reverseComplement($s);
+   $f=$$rx[-1]->[2];
+   }
+  else {
+   map { $s.=substr($ntseq, $_->[0]-1, $_->[1]-$_->[0]+1) } @$rx;
+   #first check if the given frame is OK
+   }
+ print STDERR "ERROR: invalid sequence length at $_[0]->[0]-$_[0]->[1]\n" if length($s)<=3;
+ $f=$$rx[0]->[2];
+ $f=0 unless $f>0;
+ my @c=unpack('A'.$f.'(A3)*',$s);
+ shift(@c);
+ my $lastcodon=pop(@c);
+ $$rlastc=$lastcodon if $rlastc;
+ my $stopfound;
+ #print STDERR ".. trying original frame: $f\n";
+ foreach my $codon (@c) { if ($stop{$codon}) {
+    $stopfound=1;
+    #print STDERR "    STOP found.\n";
+    last;}
+    }
+ return $stopfound;
+ }
+
+sub reverseComplement {
+  my $s=reverse($_[0]);
+  $s =~ tr/AaCcTtGgUuMmRrWwSsYyKkVvHhDdBb/TtGgAaCcAaKkYyWwSsRrMmBbDdHhVv/;
+  return $s;
+ }
+
+
+sub up2gb {
+ my $uid=shift(@_);
+ my $first;
+ if ($nodb) {
+  $first='UP2GB_'.$uid;
+  }
+ else { 
+  $ds->exec($sth, $uid);
+  print STDERR "querying for $uid..\n" if $debug;
+  while (my $r=$ds->fetch($sth)) {
+  $first=$$r[0] unless $first;
+  }
+ }
+ ($first)=($first=~m/^([\w\.]+)/) if $first;
+ print STDERR "    up2gb:  $uid -> '$first'\n" if $debug;
+ #unless ($first) {
+ #  print STDERR "WARNING: no GB accession returned for UniProt $uid!".
+ #    "($sql)\n";
+ #  }
+ return $first; 
+}

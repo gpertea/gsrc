@@ -1,0 +1,490 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+use Cwd 'getcwd';
+use FindBin;
+use lib $FindBin::Bin;
+use Mailer;
+
+my $usage = qq/ Usage: 
+ gicl <fasta_db> [-d <refDb>] [-g condor|sge|smp] [-c {<num_CPUs>]
+     [-m <user>] [-l <min_overlap>] [-v <max_overhang>] [-R <refprefix>]
+     [-p <pid>] [-n slicesize] [-M] [-L <local_wrk_dir>] [-S] [-K] [-X] 
+     [-I] [-C] [-W <pairwise_script.psx>] [-D]
+ Options:
+     -c : use the specified number of CPUs on local machine
+          (or on a grid if -g option was given); default 1
+  Clustering phase options:
+     -d do not perform all-vs-all search, but search <fasta_db> against 
+        <refDb> instead; unless -R options was given, exit after the
+        pairwise hits are generated and sorted
+     -n number of sequences in a clustering search slice (default 1000)
+     -p minimum percent identity for overlaps <PID> (default 96)
+     -l miminum overlap length (default 40)
+     -v maximum length of unmatched overhangs (default 30)
+     -R instead of full assembly, perform "containment clustering" 
+        with nrcl followed by assembly-on-Reference using mblaor;
+        <refprefix> is the "full length" sequence name prefix 
+        as used in the input files;
+     -L special grid worker mode - assumed local copies exist for
+        the given files in the provided <local_wrk_dir>, which will be
+        used to prefix <fasta_db> and <refDb> unless they are given
+        with absolute paths
+     -I do not rebuild database indices
+     -K skip the pairwise searches, directly run the assembly program
+        on previously obtained overlaps
+     -M ignore lower-case masking in <fasta_db> sequences
+     -S merge the pairwise search results without sorting them (enforces -X
+        so no assembly will be performed)
+     -W use custom script <pairwise_script.psx> for the distributed 
+        pairwise searches instead of the default: gicl_mgbl.psx
+     -X do not perform assembly, only run the pairwise searches
+        and sort\/merge the results
+     -Z only run the distributed pairwise searches and exit
+        (without even merging the resulting pairwise overlaps)
+     /;
+
+my @start_params=@ARGV;
+
+my $usemail=0; #set to 1 after initialization
+my $no_error=1;
+my $exit_msg='';
+my $cur_step;
+die $usage."\n" if (@ARGV<1 || $ARGV[0] =~ /^\-/);
+
+my $wrkdir=$ENV{'PWD'};
+
+&addPath($FindBin::Bin);
+&addPath($FindBin::Bin.'/bin') if -d $FindBin::Bin.'/bin';
+
+my $dbfile=shift(@ARGV);
+
+umask 0002;
+
+getopts('DJMISKZXSW:R:L:r:d:c:m:n:p:l:v:g:') || die "$usage\nError at getopts!\n";
+my $debug=$Getopt::Std::opt_D;
+my $localdirbase=$Getopt::Std::opt_L;
+$localdirbase=~s/\/+$//;
+my $gridx=$Getopt::Std::opt_g || 'smp'; #use gridx instead; must be 'smp', 'sge' or 'condor'
+$gridx=lc($gridx);
+my $dbfname=&getFName($dbfile);
+my $dbfullpath=&getFullPath($dbfile);
+die "Error: cannot find input file '$dbfile'\n" unless -s $dbfile;
+#unless ($localdirbase) {
+# die "Error: cannot find input file '$dbfile'\n" unless -s $dbfullpath;
+# }
+my $asm_paramfile=$Getopt::Std::opt_P;
+if ($asm_paramfile) {
+  $asm_paramfile=&getFullPath($asm_paramfile);
+  die "Error: cannot find quality file '$asm_paramfile'\n" unless -s $asm_paramfile;
+  }
+my $cpus = $Getopt::Std::opt_c || 1;
+#my $psxcmd = $gridx ? "gridx -g $gridx -p $cpus": "psx -p $cpus";
+my $psxcmd = "gridx -T -g $gridx -p $cpus";
+$psxcmd.=" -L $localdirbase" if $localdirbase && $gridx;
+my $mailuser = $Getopt::Std::opt_m;
+my $nosort = $Getopt::Std::opt_S ? '-M' : '';
+my $maxovh=$Getopt::Std::opt_v || 30;
+#$maxovh+=10 if $clustprog eq 'lclust';
+my $minovl=$Getopt::Std::opt_l || 40;
+my $pid=$Getopt::Std::opt_p || 96;
+$pid=96 if $pid<90;
+$minovl=40 if $minovl==0;
+my $no_zmerge=$Getopt::Std::opt_Z;
+my $onlysearch=$Getopt::Std::opt_X;
+my $startdate=getDate();
+my $nomasking=$Getopt::Std::opt_M ? 'M':'';
+my $useDb=$Getopt::Std::opt_d;
+my $useDbname;
+if ($useDb) {
+ $useDbname=&getFName($useDb);
+ $useDb=&getFullPath($useDb);
+ unless ($localdirbase) {
+  die "Error: cannot locate the specified db: $useDb" unless -s $useDb;
+  }
+}
+
+my $psx_clust=$Getopt::Std::opt_W || 'gicl_mgbl.psx';
+my $refprefix = $Getopt::Std::opt_R || $Getopt::Std::opt_r;
+die "$psx_clust not available in PATH!\n" 
+   unless ($psx_clust=&checkCmd($psx_clust));
+
+
+my $r;
+#=- logging system initialization:
+my $log_file="gicl_$dbfname.log";
+my $err_log="err_gicl_$dbfname.log";
+unlink($log_file, $err_log);
+open(OLDSTDERR, ">&STDERR");
+
+open(STDOUT, ">$log_file") || &MErrExit("Failed to redirect STDOUT to $log_file");
+open(STDERR, ">$err_log") || &MErrExit("Failed to redirect STDERR to $err_log");
+&set_step('Initialization');
+
+&flog("$FindBin::Script running options: \n".$FindBin::Script.' '.join(" ", @start_params));
+&flog(" Standard log file: $log_file");
+&flog(" Error log file:    $err_log");
+&flog(" Using $cpus CPUs for clustering and assembly");
+#&flog(" Path is : $ENV{'PATH'} ");
+$no_error=0;
+$usemail=1 && $mailuser;
+
+my $clusterfile=$dbfname.($useDb ? '_'.$useDbname :'_cl').'.ace';
+
+my ($cmd, $psxparam);
+$Getopt::Std::opt_I=1 if $Getopt::Std::opt_K || $localdirbase;
+
+
+my $dbfileidx=$dbfullpath.'.cidx';
+
+#
+# rebuild indices (unless specifically told not to do so)
+unless ($Getopt::Std::opt_I) {
+ my $toindex = $useDb ? $useDb : $dbfile ;
+ &flog("-= Rebuilding $toindex indices =-");
+ $cmd="formatdb -p F -o F -i $toindex";
+ # just in case, rebuild the cdbfasta index
+ system($cmd) &&
+   &MErrExit("Error at '$cmd'");
+ # -- also make sure the cdb index for the main file is created 
+ if ($useDb) {
+    system("cdbfasta $useDb") && 
+     &MErrExit("Error at cdbfasta $useDb");
+    }
+ system("cdbfasta $dbfile") && 
+    &MErrExit("Error at cdbfasta $dbfile");
+ }
+
+#========= compress & merge sort the cluster results
+my $hitsort = $dbfname.'_'.($useDb ? $useDbname.'_tabhits' : 'cl_tabhits');
+my $rbasename = $dbfname.'_'.($useDb ? $useDbname : 'self');
+my $acefile = $rbasename;
+
+if ($Getopt::Std::opt_J) {
+ goto ZMERGE;
+ }
+
+PAIRWISE:
+#=- start clustering the $blastDB file
+&set_step('pairwise');
+unlink($clusterfile);
+if ($Getopt::Std::opt_K) {
+  &flog("-- Skipping pairwise searches.\n");
+  goto ASSEMBLE;
+  }
+my $numseqs = $Getopt::Std::opt_n || 1000;
+system('/bin/rm -rf cluster_[1-9]*') unless $Getopt::Std::opt_J;
+# ---psx user parameter format:   <db>:<minpid>:<maxovh>:<minovl>:<flags>
+#  where <flags> are one or more letters of: 
+#      D=no self-clustering, M = no masking, G = gap info
+my $dbflag=$useDb?'D':'';
+my $paramdb=$useDb? $useDb : $dbfullpath;
+my $gapinfo='G'; #always save gap info
+$psxparam=join(':', ($paramdb,$pid,$maxovh,$minovl,$nomasking.$gapinfo.$dbflag));
+$cmd=$psxcmd." -n $numseqs -i $dbfile -d cluster -C '$psxparam' -c '$psx_clust'";
+$cmd.=' -D' if $debug && $gridx;
+&flog("  Launching distributed clustering: \n $cmd");
+system($cmd)
+   && &MErrExit("Error at '$cmd'\n");
+&end_step();
+
+if ($no_zmerge) {
+  &flog("Exit requested after pairwise searches.");
+  # &flog($exit_msg);
+  # generate the clustering singleton list here?
+  goto THEEND;
+ }
+
+ZMERGE:
+&set_step('mgmerge');
+my @dirs = ((<cluster_?>),(<cluster_??>));
+unlink('masked.lst');
+my @zdirfiles=(<zdir_*.gz>);
+unlink(@zdirfiles) if @zdirfiles;
+my @zfiles=((<cluster_?/*.gz>),(<cluster_??/*.gz>));
+if (@zfiles>16) {
+ foreach my $dir (@dirs) {
+    next unless -d $dir;
+    system("cat $dir/masked.lst >> masked.lst");
+    zmergeDirHits($dir);
+    }
+}
+else { #can merge all directly
+ foreach my $dir (@dirs) {
+    next unless -d $dir;
+    system("cat $dir/masked.lst >> masked.lst");
+    }
+ foreach my $zf (@zfiles) {
+    my $zdf=$zf;
+    $zdf=~s/cluster_\d+\///;
+    system("ln -s $zf zdir_$zdf");
+    }
+}
+#$cmd="mgmerge -b $nosort -o $hitsort -s 1600 zdir_*.bz2";
+$cmd="mgmerge $nosort -o $hitsort -s 1600 zdir_*.gz";
+system($cmd)
+      && &MErrExit("Error at final sort:\n $cmd");
+unless($debug) {
+  #system('/bin/rm -rf zdir_*.bz2') unless $debug;
+  system('/bin/rm -rf zdir_*.gz');
+  foreach my $dir (@dirs) {
+     if (-d $dir) {
+        system("/bin/rm -rf $dir");
+     }
+  }
+}
+goto THEEND if $nosort;
+if ($onlysearch || ($useDb && !$refprefix)) {
+  &flog("Exit requested after pairwise searches and sorting") if $onlysearch;
+  # &flog($exit_msg);
+  # generate the clustering singleton list here?
+  goto THEEND;
+ }
+
+ASSEMBLE:
+&set_step('assemble');
+if ($refprefix) {
+  $acefile.='.aor.ace';
+  my $lytfile= $rbasename.'.nrcl.lyt'; 
+  #$cmd="bzip2 -cd ${hitsort}_*.bz2 | nrcl OVHANG=$maxovh -o $rbasename.nrcls -y $lytfile";
+  $cmd="gzip -cd ${hitsort}_*.gz | nrcl OVHANG=$maxovh -o $rbasename.nrcls -y $lytfile";
+  $refprefix=~s/\|$//;
+  $cmd.=" -p '$refprefix'";
+  system($cmd)
+    && &MErrExit("Error at command: $cmd");
+  #now assemble using aor
+  $cmd = "mblaor $lytfile -d $dbfileidx -c $maxovh -p '$refprefix' -o $acefile";
+  system($cmd)
+    && &MErrExit("Error at assembly command: $cmd");
+  }
+else { # straight-forward, all vs all assembly
+ $acefile.='.ace';
+ #$cmd="bzip2 -cd ${hitsort}_*.bz2 | mblasm -d $dbfileidx -c $maxovh -o $acefile";
+ $cmd="gzip -cd ${hitsort}_*.gz | mblasm -d $dbfileidx -c $maxovh -o $acefile";
+ &flog("Running assembly command: $cmd\n");
+ system($cmd)
+    && &MErrExit("Error at assembly command: $cmd");
+}
+&end_step();
+
+SINGLETSONLY:
+&set_step('singletons');
+
+unless ($Getopt::Std::opt_a) {
+ #build the singleton list if the full straight clustering/assembly pipeline was run
+ $cmd='grep "^AF " '.$acefile.'| cut -d " " -f2 | sort -u > seqnames_in_asms';
+ system($cmd) && &MErrExit("Error running:\n$cmd\n");
+ $cmd="cdbyank -l $dbfileidx | sort > seqnames_all";
+ system($cmd) && &MErrExit("Error running:\n$cmd\n");
+ my $sglist = $rbasename.'.singletons';
+ $cmd="comm -23 seqnames_all seqnames_in_asms > $sglist";
+ system($cmd) && &MErrExit("Error running:\n$cmd");
+ unlink('seqnames_all', 'seqnames_in_asms');
+ print STDERR "Singletons are listed in file: $sglist\n";
+ }
+  
+&end_step();
+
+THEEND:
+$no_error=1;
+&flog("*** gicl [$rbasename] finished ***");
+
+
+#=====================================================================
+#=========================    SUBROUTINES   ==========================
+#=====================================================================
+
+END { #to be executed on exit
+ if ($cur_step && $err_log) {
+   my $step_log=`cat $err_log`;
+   $step_log =~ s/\s+$//;
+   $exit_msg.="\nThis is the content of the error log file (ended at $cur_step):\n$step_log"
+      if $step_log;
+   my $host=$ENV{'HOST'} || $ENV{'HOSTNAME'};
+   my $msg = $no_error ? qq/$FindBin::Script ($dbfile) finished on machine $host
+                 in $wrkdir, without a detectable error.
+                 / :
+                 qq/$FindBin::Script ($dbfile) encountered an error at step $cur_step
+                 Working directory was $wrkdir.                 
+                 /;
+   unless ($no_error) { #an abnormal termination
+     &flog("\nProcess terminated with an error, at step '$cur_step'!");
+     &send_mail({to=>$mailuser, subj=>"$FindBin::Script ($dbfile) error at $cur_step!",
+          body=>$msg.$exit_msg}) if $usemail;   
+     &flog($msg);
+     }
+   else {
+     #&flog("*** Done ***") if ($cur_step && lc($cur_step) ne 'Initialization');
+     &send_mail({to=>$mailuser, subj=>"$FindBin::Script ($dbfile) finished.",
+          body=>$msg.$exit_msg}) if $usemail;
+     }
+   print OLDSTDERR $msg;
+   }
+}
+
+#== checkCmd -- checks for executable, in the PATH if no full path given
+sub checkCmd {
+ my $cmd=$_[0];
+ if ($cmd =~ m/^\//) {
+   return (-x $cmd) ? $cmd : '';
+   }
+ my @paths=split(/:/, $ENV{'PATH'});
+ foreach my $p (@paths) {
+  return $p.'/'.$cmd if -x $p.'/'.$cmd;
+  }
+ return ''; 
+}
+
+sub flog {
+ print STDOUT join("\n",@_),"\n";
+ print STDERR join("\n",@_),"\n";
+}
+
+sub MErrExit {
+ #print STDERR $_[0]."\n";
+ $exit_msg.=$_[0].$_[1];
+ &flog($exit_msg);
+ exit(1) unless defined($_[1]);
+ die $_[1];
+ }
+
+
+sub set_step {
+ $cur_step=$_[0];
+ &flog(">>> --- $cur_step [$dbfile] started at ".&getDate());
+}
+
+sub end_step {
+ &flog("<<< --- $cur_step [$dbfile] finished at ".getDate());
+}
+
+#a basic date function :
+sub getDate {
+ my $date=localtime();
+ #get rid of the day so Sybase will accept it
+ (my $wday,$date)=split(/\s+/,$date,2);
+ return $date;
+}
+
+sub getFullPath {
+ if ($localdirbase) {
+   return ($_[0] =~ m/^\//) ? $_[0] : $localdirbase.'/'.$_[0];
+   }
+ else {  
+  return ($_[0] =~ m/^\//) ? $_[0] : $ENV{'PWD'}.'/'.$_[0];
+  }
+}
+
+sub getFName {
+if ($_[0] =~ m/.+[\/\\](.*?)$/) {
+  return $1;
+  }
+else {
+  return $_[0];
+  }
+}
+
+# sub addPath {
+#  my $path=$ENV{'PATH'};
+#  foreach my $p (@_) {
+#   next if ($p eq $path || m/\Q:$p$/ 
+#           || m/:\Q$p:/ || m/^\Q$p:/);
+#   $path=$p.':'.$path;
+#   }
+#  $ENV{'PATH'}=$path; 
+# }
+
+sub addPath {
+ my $path=$ENV{'PATH'};
+ my @allp=split(/\:/,$path);
+ my %h;
+ @h{@allp}=(); 
+ foreach my $p (@_) {
+  next if exists($h{$p});
+  $path=$p.':'.$path;
+  }
+ $ENV{'PATH'}=$path;
+}
+
+sub zmergeDirHits {
+ my ($dir)=@_;
+ my $maxfopen=16; #max files to open once -- must never fail due to hitting the system limit
+ my $run=0;
+ my $startDir=getcwd(); # from Cwd module
+ chdir($dir) || die "Cannot change to $dir directory!\n";
+ my $numFiles=0;
+ while (1) {
+   opendir(FDIR, '.') || die "Cannot open directory $dir\n";
+   my @allfiles=readdir(FDIR); #possibly large array w/ all the files from that directory
+   close(FDIR);
+   #@allfiles=grep(/\.bz2$/, @allfiles);
+   @allfiles=grep(/\.gz$/, @allfiles);
+   $numFiles=@allfiles;
+   last if ($numFiles<=$maxfopen);
+   my @files;
+   foreach my $f (@allfiles) {
+      #next unless ($f=~m/\.tab\.bz2$/ || $f=~m/zMrg_p\S+\.bz2$/);
+      next unless ($f=~m/\.tab\.gz$/ || $f=~m/zMrg_p\S+\.gz$/);
+      push(@files, $f);
+      if (@files==$maxfopen) {
+        #my $sortcmd="mgmerge -b $nosort -o zMrg_p$run -s 1200 ".join(' ',@files);
+        my $sortcmd="mgmerge $nosort -o zMrg_p$run -s 1200 ".join(' ',@files);
+        $run++;
+        &runCmd($sortcmd);
+        if ($debug) {
+             foreach my $rf (@files) {
+               my $ren=$rf;
+               #$ren=~s/\.bz2$/\.bz/;
+               $ren=~s/\.gz$/\.gZ/;
+               rename($rf, $ren);
+               }
+             }
+          else {
+             unlink(@files);
+             }
+        @files=();
+        }
+       }
+   if (@files>1) {
+        #my $sortcmd="mgmerge -b $nosort -o zMrg_p$run -s 1200 ".join(' ',@files);
+        my $sortcmd="mgmerge $nosort -o zMrg_p$run -s 1200 ".join(' ',@files);
+        $run++;
+        &runCmd($sortcmd);
+        if ($debug) {
+          foreach my $rf (@files) {
+            my $ren=$rf;
+            #$ren=~s/bz2$/bz/;
+            $ren=~s/gz$/gZ/;
+            rename($rf, $ren);
+            }
+          }
+        else { 
+          unlink(@files); 
+          }
+        }
+   };
+ chdir($startDir);
+ if ($numFiles) { #some directories may be empty!
+   #my $sortcmd="mgmerge -b $nosort -o zdir_$dir -s 1700 $dir/*.bz2";
+   my $sortcmd="mgmerge $nosort -o zdir_$dir -s 1700 $dir/*.gz";
+   runCmd($sortcmd);
+   }
+ system("/bin/rm -rf $dir") unless $debug;
+}
+
+sub runCmd {
+ my $cmd=shift(@_);
+ print STDERR "Running:\n$cmd\n" if $debug;
+ my $errout=`( $cmd ) 2>&1`;
+ my $errcode=$?;
+ print STDERR $errout;
+ if ($errcode) {
+  print STDERR "Error status detected (code=$errcode) at command $cmd\n";
+  exit(1); #exit, but do not report error 
+           #- so we can continue to assemble the rest of the clusters!
+  }
+ if ($errout=~/aborted|error|fail|segmentation|violation|cannot|no such file/i) {
+   print STDERR "Error message detected after running command:\n$cmd\n";
+   exit(2);
+   }
+}

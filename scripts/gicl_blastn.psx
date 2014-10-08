@@ -1,0 +1,75 @@
+#!/usr/bin/perl
+use strict;
+use FindBin;
+
+umask 0002;
+
+$ENV{'PATH'}=$FindBin::Bin.':'.$ENV{'PATH'};
+
+#so for pvmsx to consider the task was successful, $file must be deleted!
+#============== 
+# 1 is the name of the fasta sequence input file
+# 2 is the # of sequences in ${1} should = 1 for this script
+# 3 is the slice no. being processed by sx
+# 4 is 0 if not the last file, 1 if the last file
+# 5 is the # of sequences skipped initially
+# 6 is the # of sequences to be processed (-1 = ALL)
+# 7 user parameter
+#     1        2        3         4          5       6    
+my ($file, $numseqs, $slice_num, $last, $skipped, $total, $userparams)=@ARGV;
+#user parameters:
+# 1) database (full path)
+# 2) PID cutoff (using 94 if not specified)
+# 3) maximum overhang
+# 4) minimum overlap
+# 5) extra flags (optional)
+# flags: M = no masking, D= separate database (not all-vs-all)
+#        G = show gaps
+my ($searchdb,$pid,$maxovh,$minovl, $xflags)=split(/:/,$userparams);
+my $blast_res=$file.'.tab';
+my $nomasking = $xflags=~/M/;
+my $gapinfo = $xflags=~/G/;
+my $otherDb = $xflags=~/D/;
+
+$pid=25 unless $pid>20; #not used for this blastn search
+$minovl=40 unless $minovl; #not used for this blastn
+my $log_file='log_std';    
+my $err_file='err_log';
+open(STDERR, '>>'.$err_file);
+open(STDOUT, '>>'.$log_file);
+
+my $toskip = $skipped+$numseqs*($slice_num-1);
+
+my $cmd = "blastn $searchdb $file W=9 E=1e-10 B=300 V=300 -noseqs -notes -warnings -novalidctxok -cpus=1 -topcomboN 1 ";
+$cmd.= " -dbrecmin $toskip " if $toskip>0 && $otherDb==0;
+# $cmd.= "| blastflt PID=25 | bzip2 -cf > $blast_res.bz2";
+$cmd.= "| blast2btab PID=25 | bzip2 -f > $blast_res.bz2" ;
+# $cmd.=$gapinfo ? ' -D5 ':' -D4 ';
+# $cmd.= ($nomasking) ? ' -FF -UF '  : ' -UT -F "m D" ';
+# unless ($otherDb) {
+# $cmd.=' -KT ';
+# $cmd.= " -k $toskip " if $toskip>0; 
+#  }
+#$cmd.=" > $blast_res";
+my $slno=sprintf("slice:%09d",$slice_num);
+print STDERR ">>$slno: $cmd\n";
+
+my $errmsg = `($cmd) 2>&1`;
+my $r=$?;
+print STDERR "<<$slno: done.\n";
+
+if ($r || ($errmsg=~/ERROR/is) || ($errmsg=~/Segmentation/is)) {
+  print STDERR "!Error at:\n$cmd\n";
+  print STDERR "$errmsg\n";
+  exit(1);
+  }
+#------- sorting of results not needed for blastn  
+# $cmd="sort -k11,11g -k10,10nr -k9,9nr $blast_res | bzip2 -cf > $mgblast_res.bz2";
+# $errmsg=`($cmd) 2>&1`;
+#$r=$?;
+#if (($r && ($r>>8 != 2)) || $errmsg=~m/memory/is) {
+#   die "Error sorting/compressing the results file '$mgblast_res'\n$cmd\n";
+#   }
+# unlink($file, $mgblast_res);
+unlink($file);
+exit 0;

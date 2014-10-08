@@ -1,0 +1,21 @@
+#!/usr/bin/perl
+use strict;
+my $usage = q/Usage:
+ duh [<directories..>]
+ Shows du (disk usage) sorted by decreasing size, with 
+ human-readable suffixes (G,M)
+ If no arguments are given the size of all files and directories 
+ within the current directory is considered.
+ /;
+umask 0002;
+die($usage."\n") if $ARGV[0]=~m/^\-+h/;
+my $cmd=(@ARGV==1) ? 'du -shx ' : 'du -schx ';
+my $q = @ARGV>0; #user provided target
+$cmd.= $q ? join(' ',@ARGV) : '* .[^.]*';
+open(DU, "-|", "$cmd 2>/dev/null") || die("Error starting $cmd | pipe!\n");
+# Schwartzian transform
+my %byte_order=(K => 0, M => 1, G => 2, T => 3);
+print map { $_->[0]=~m/^[\d\.]*K?\s+/ && !$q ? '' : $_->[0]=~s/^(\S+)\s+total/( $1 total )/ ? $_->[0] : $_->[0] }
+   sort { $byte_order{$main::a->[1]} <=> $byte_order{$main::b->[1]} || $main::a->[2] <=> $main::b->[2] }
+    map { [ $_, /([MGKT])/, /(\d+)/ ] } <DU> ;
+close(DU);

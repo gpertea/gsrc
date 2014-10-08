@@ -1,0 +1,183 @@
+#!/usr/bin/perl
+use strict;
+use FindBin;
+use Getopt::Std;
+use lib $FindBin::Bin;
+use dbSession;
+
+my $usage=q/Usage:
+ mybcpin -b <targetdb> [-T] [-I] [-c '<column_delim>'] [-r 'row_delim'] <files>..
+
+ Loads multiple bcp files into tables of database <targetdb>.
+ The first token of each name of the input <files> should correspond to 
+ the exact target table name in the database <targetdb>.
+ (e.g. a filename called 'names.bcp.bz2' will be loaded in table 'names')
+
+ For file names with the extension .z, .gz, gzip, .bz2, .bzip2 or .bz, such
+ input files are decompressed first.
+ 
+ <targetdb> can be given in the format: <db>[@<server>][:<user>]
+ (complete login information is taken from your ~\/.db_pass 
+  authentication file, use dbpass utility to maintain it)
+
+ Options (for each input file\/table):
+  -T    : truncate the table before loading data
+  -I    : disable the indices before, and
+          enable them after loading data
+  -c,-r : provide custom column\/row delimiters (defaults are tab and 
+          newline, respectively)
+/;
+my $bcpcmd=`which mysqlimport`;chomp($bcpcmd);
+die "Error: mysqlimport not found in path!\n" unless -e $bcpcmd;
+die "$usage\n" unless @ARGV;
+
+print STDERR "Command line: $0 ".join(' ',@ARGV)."\n";
+
+
+getopts('TIb:c:r:') 
+   || die "$usage\nError getting options!\n";
+my $targetdb = $Getopt::Std::opt_b || die "$usage Target database not specified!\n";
+my ($coldelim, $rowdelim)=($Getopt::Std::opt_c, $Getopt::Std::opt_r);
+my $coldelimflag="--fields-terminated-by='$coldelim'" if $coldelim;
+my $rowdelimflag="--lines-terminated-by='$coldelim'" if $rowdelim;
+my ($truncate, $dropidx)=($Getopt::Std::opt_T, $Getopt::Std::opt_I);
+
+$coldelim="\t" unless $coldelim;
+$rowdelim="\n" unless $rowdelim;
+my @files=@ARGV;
+my @authdta;
+my ($server, $user, $pass, $db, @authdta)=&db_perm($targetdb, undef, 'ASK');
+print STDERR "Connecting to server $server (user=$user, db=$db)\n";
+my $dbh=&db_login($server, $user, $pass, $db, @authdta);
+
+#die "Error: dbo permissions needed for current user ($user)!\n"
+#   unless syb_dboalias($dbh);
+
+#fetch the identity information for that annoying -E flag of bcp in
+# my %hasident;
+# print STDERR "..find $db tables with identity fields..\n";
+# my $sth=&sql_exec($dbh, q/
+#    select so.name from sysobjects so, 
+#      syscolumns sc where sc.status & 128 = 128 
+#      and sc.id=so.id
+#   /);
+# while (my $r=&sth_fetch($sth)) {
+#  $hasident{$$r[0]}=1;
+#  }
+ 
+print STDERR "..start processing bcp files..\n";
+#$server=uc($1) if ($server=~m/^(\w+)\./); #NEOSYBASE case before full client upgrade
+
+my $text_size = 9900000;
+foreach my $file (@files) {
+    my ($tab)=($file=~/^(\w+)/);
+    my $bcplog="${tab}_bcp.log";
+    if (-s $bcplog) {
+        print STDERR ">>   ..skipping file $file (because log $bcplog was found)\n\n";
+        next;
+        }
+    my $start = time;
+    my $start_str = localtime($start);
+    warn ">>Processing file $tab ...\n";
+    my $unzcmd;
+    #try to use the 
+    if ($file=~/\.g?zi?p?$/i) {
+      $unzcmd='gzip -cd '.$file;
+      }
+     elsif ($file=~/\.bzi?p?2?$/i) {
+      $unzcmd='bzip2 -cd '.$file;
+      }
+    my $bcpinput=$file;
+    my ($postcmd);
+    if ($unzcmd) {
+      $bcpinput=$tab.'.unz.bcp';
+      #system("rm -f $bcpinput");
+      #system("mknod $bcpinput p") && die "Error: mknod $bcpinput p failed!\n";
+      print STDERR " ..uncompressing $file to $bcpinput..\n";
+      open(TOBCP, '>'.$bcpinput) || die "Error creating file '$bcpinput'!\n";
+      open(UNZ, $unzcmd.'|') || die "Error: failed to open '$unzcmd' pipe\n";
+      #local $/="(**)\n"; #one row at a time, not a line!
+      local $/=$rowdelim;
+      while (<UNZ>) {
+       #row processing here:
+       #print TOBCP &processRow($_);
+       #my @t=split(/\!~~\!/s);
+       my @t=split(/$coldelim/s); #if there are metachars in there, bad luck..
+       chomp($t[-1]);
+       foreach my $v (@t) {
+         if ($v=~m/^([\-\d\.]+)e\-(\d+)$/i) {
+           my ($mant, $exp)=($1,$2);
+           $v=sprintf('%.4e',$v);
+           $v='0.0' if $exp>300;
+           }
+       # -- the transform below can be commented out 
+       # if you really have values when more than 2 decimals matter!
+       elsif ($v=~m/^\d{2,3}\.\d{3,}$/) { #percent value here
+          $v=sprintf('%4.2f',$v);    #round to two decimals
+                                     #nobody cares about the other decimals
+          }
+         }
+       print TOBCP join($coldelim,@t).$rowdelim;
+       }
+      #system("$unzcmd > $bcpinput") && die "Error uncompressing $file!\n";
+      close(UNZ);
+      close(TOBCP);
+      my $duration = time - $start;
+      print STDERR "  Finished unpacking - it took $duration seconds.\n"
+      }
+    # else { - we should filter uncompressed files too!
+    #  
+    #  }
+    
+   
+    # my $identflag = exists($hasident{$tab}) ? ' -E ' : '';
+    
+    
+    if ($truncate) {
+     &sql_do($dbh, "truncate table $tab");
+     }
+    #my @tabidx;
+    if ($dropidx) {
+     #@tabidx=&syb_getIndexes($dbh, $tab, 1);
+     &sql_do($dbh, "alter table `$tab` disable keys");
+     }
+
+    #     my $bcpjob="$bcpcmd $db..$tab in $bcpinput -m1 -c ".
+    #            " $coldelimflag $rowdelimflag ".
+    #            "-U$user -P $pass -S $server $identflag -b 10000 -T $text_size ".
+    #            "-e $bcplog";
+    
+    my $inopts="-h $server -u $user -L --password=$pass $coldelimflag $rowdelimflag";
+    my $bcpjob="$bcpcmd $inopts $db $bcpinput";
+    print STDERR "..started loading $bcpinput..\n";
+    my $joboutput=`( $bcpjob ) 2>&1`;
+    my $status=$?;
+    #die "ERROR status $status at bcp from $db..$tab\n" if $status;
+    my $alloutput=$joboutput;
+    if (-s $bcplog) {
+      $alloutput.="\n ------error log content ($bcplog): \n";
+      $alloutput.=`cat $bcplog`;
+      }
+    local *TOLOG;
+    open(TOLOG, '>>'.$bcplog);
+    print TOLOG "\n$joboutput\n";
+    close(TOLOG);
+    if ($dropidx) {
+     # &syb_putIndexes($dbh, @tabidx);
+     &sql_do($dbh, "alter table `$tab` enable keys");
+     }
+    $bcpjob=~s/--password=\S+/--password=<yourpass>/;
+    die "Error detected at bcp-in $file file: \n$alloutput\n$bcpjob\n"
+      if $status || ($joboutput=~/error|fail|fatal|truncat|permission/i);
+    system("rm -f $bcpinput") if $unzcmd;
+    my $tot = time - $start;
+    if ($dropidx) {
+     #@tabidx=&syb_getIndexes($dbh, $tab, 1);
+     &sql_do($dbh, "alter table `$tab` enable keys");
+     }
+
+    print STDERR "<< $tab done in $tot seconds (exit code $status)\n\n";
+
+}
+&db_logout($dbh);
+#-----------------------

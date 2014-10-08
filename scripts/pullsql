@@ -1,0 +1,89 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+use strict;
+# {
+#  my $sd=$ENV{'SCRIPT_FILENAME'};
+#  push(@INC,$sd ? substr($sd, 0, rindex($sd, '/')) : '.');
+# }
+
+use FindBin;
+use lib $FindBin::Bin; 
+use dbSession;
+
+my $usage = q/
+  Extracts data from a database based on a sql query. 
+  Usage: 
+    pullsql [<sql_file>] -b <db> [-c <csep>] [-r <rsep>] [-FC]
+        [-a <authfile>] [-o <output_file>]
+      <sql_file> will be the query command to use; otherwise
+                 the standard input is used. 
+      -b         <target> will select a target database, based on the global 
+                 authentication file. May also be <db>[@<server>][:<user>]
+      -c <csep>  column separator character; default is tab (\t)
+      -r <rsep>  row separator character; default is new line (\n)
+      -F         indicates that the results will be FASTA formatted
+                 (result columns are expected as: seq_name, sequence)
+      -C         only considered for -F option, this will extract only
+                 a given range from the sequence, end5 and end3 
+                 coordinates being expected as the third and fourth 
+                 result columns (seq_name, sequence, end5, end3)
+      -o         send the output to <outputfile> instead of stdout           
+  If no authentication information is found, the read-only 'access' account
+  will be used, using probably SYBTIGR as a server.
+/;
+
+my $qfile;
+$qfile=shift if (substr($ARGV[0],0,1) ne '-');
+
+getopts('hb:c:r:a:o:FC') || die $usage;
+
+die $usage if ($Getopt::Std::opt_h);
+
+my $tdb=$Getopt::Std::opt_b;
+my $errmsg="Error: ";
+&ErrExit($usage.$errmsg."Target database not specified!") unless $tdb;
+my @auth = &db_perm($tdb, $Getopt::Std::opt_a);
+
+&ErrExit($usage.$errmsg."SQL command file not found.") 
+               unless (!$qfile || -e $qfile);
+my $outfile=$Getopt::Std::opt_o;               
+if ($outfile) {
+ open(OUTFILE, '>'.$outfile) || die "Cannot create file '$outfile'!\n";
+ select(OUTFILE);
+ }
+my $query="";
+if ($qfile)
+  { local $/=undef;
+    open(INFILE, $qfile);
+    $query=<INFILE>; #slurp
+    close(INFILE);
+   }
+ else 
+  { local $/="\n";
+    print STDERR ">Enter SQL command(s) for server $auth[0], in db $auth[3], user $auth[1]\n".
+                 " (press Enter followed by Ctrl+D to send the query) :\n";
+    $query.=$_ while (<STDIN>);
+   }
+print STDERR ("\nSending query to $auth[0]..\n");
+my $csep=$Getopt::Std::opt_c;
+$csep="\t" unless $csep;
+my $rsep=$Getopt::Std::opt_r;
+$rsep="\n" unless $rsep;
+my $dbh=&db_login(@auth);
+my $total;
+if ($Getopt::Std::opt_F) {
+  if ($Getopt::Std::opt_C)
+     { $total=&sql2fasta_CLR($dbh, $query);}
+   else
+     { $total=&sql2fasta($dbh, $query);}
+  } 
+ else {  
+  $total=&print_sql($dbh, $query, $csep, $rsep);
+  }
+&db_logout($dbh);
+if ($outfile) {
+ select(STDOUT);
+ close(OUTFILE);
+ }
+print STDERR "\nA total of $total row(s) were extracted.\n";

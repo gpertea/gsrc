@@ -1,0 +1,51 @@
+#!/bin/tcsh -f
+# 
+#     1        2        3         4          5       6       7
+#my ($file, $numpass, $slice_num, $last, $skipped, $total, $user)=@ARGV;
+set fq=$1
+set numpass=$2
+set slnum=$3
+set islast=$4
+set slskipped=$5
+set sltotal=$6
+set fesi=$7
+
+set esf=$fesi:t
+set espath=$fesi:h
+set fb=$esf:r
+set fb=$fb:r
+set srvlog=srv_${fb}_$slnum.log
+set exout=$fq.exout
+
+#goto TEST_LOOP
+
+set sv=`ps auxwww | grep exonerate-server | grep 'port 3804'`
+
+if ( $#sv > 2 ) then
+ echo "Existing server on this machine on port 3804, aborting.."
+ exit 241
+endif
+
+# echo "Launching server.."
+set cpath = `pwd`
+cd $espath
+exonerate-server --maxconnections 1  --verbosity 1 --proteinwordlen 4 --port 3804 $esf >& $cpath/$srvlog &
+set bpid = $!
+#echo "Background process ID= $bpid"
+
+cd $cpath
+
+while ( `grep listening $srvlog`"x" == "x" )
+ sleep 2
+end
+sleep 2
+echo "Running: pexo_slice.pl -o $exout $fq"
+pexo_slice.pl -o $exout $fq 
+/bin/rm -f $fq
+fltexonerate -p 75 -c 70 < $exout > $exout.p75c70.gff3
+echo '<Done.' >> /dev/stderr
+sleep 2
+
+kill $bpid
+
+exit 0

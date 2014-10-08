@@ -1,0 +1,97 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+my $usage = q/Usage:
+ ntstat [-a][-q][-t] [-g <genome_len>] input_fasta_files..
+ 
+ -a  if all input should be treated as a single fasta sequence
+     (so only the final overall summary is shown)
+ -q  omit table header in the output
+ -t  omit the summary line for multiple input files
+ -g  also report N50 and L50 for target genome of size <genome_len>
+ -G  report N50 and L50 for sum of all input contig sizes
+ 
+/;
+getopts('qatGg:') || die($usage."\n");
+my ($maxlen, $minlen)=(0,0);
+my ($allinone, $nototal) = 
+  ($Getopt::Std::opt_a, $Getopt::Std::opt_t);
+my $genomeLen=$Getopt::Std::opt_g;
+if ($genomeLen=~s/([kMG])$//i) {
+  my $mul=uc($1);
+  $genomeLen=int ($genomeLen * ($mul eq 'K' ? 1000 : 
+                      ($mul eq 'M' ? 1000000 : 1000000000)) );
+}
+print STDERR "Target genome size: $genomeLen\n" if $genomeLen;
+
+$genomeLen=1 if $Getopt::Std::opt_G;
+
+$nototal=0 if $allinone;
+print join("\t",'#/seqid    ','nt        ', 'bad        ', '%bad')."\n"
+   unless ($Getopt::Std::opt_q || $allinone);
+my ($seqcount, $ntcount, $xcount);
+
+my @arr; #keeping track of contig lengths for N50 calculation
+{
+ #local $/="\n>";
+ #my $rlinefunc;
+ my ($seqname, $seqann, $seqlen, $seqbad);
+ while (<>) {
+   s/^\s+//;
+   s/\s+$//;
+   chomp;
+   if (m/^>/) { #header line
+     my ($sid, $sann)=(m/^>(\S+)[ \t\x01]*(.*?)/);
+     $seqcount++;
+     if ($seqlen) {
+       $minlen=$seqlen if $minlen==0 || ($seqlen<$minlen);
+       $maxlen=$seqlen if $maxlen<$seqlen;
+       push(@arr, $seqlen) if $genomeLen;
+       if (!$allinone) {
+         print join("\t",$seqname, $seqlen, $seqbad, 
+              sprintf("%.2f",($seqbad*100.00)/$seqlen) )."\n";
+       }
+     }
+     ($seqname, $seqann, $seqlen, $seqbad)=($sid, $sann, 0,0);
+   }
+   else { #sequence line
+     tr/\t \n\r//d;
+     my $blen=length;
+     $seqlen+=$blen;
+     $ntcount+=$blen;
+     my $x=(tr/AaCcGgTt//c);
+     $seqbad+=$x;
+     $xcount+=$x;
+   }
+ }#while fasta records
+ if ($seqlen) {
+    $minlen=$seqlen if $minlen==0 || ($seqlen<$minlen);
+    $maxlen=$seqlen if $maxlen<$seqlen;
+    push(@arr, $seqlen) if $genomeLen;
+    if (!$allinone) {
+      print join("\t",$seqname, $seqlen, $seqbad, 
+      sprintf("%.2f",($seqbad*100.00)/$seqlen) )."\n";
+    }
+ }
+}
+$genomeLen=$ntcount if $genomeLen==1;
+my $avglen=int($ntcount/$seqcount);
+unless ($nototal || $seqcount<2) {
+    # print '#','-'x 10,' Total: ','-'x 10, "\n";
+     print join("\t",'Total:  ', $ntcount, $xcount,
+         sprintf("%.2f",($xcount*100.00)/$ntcount) )."\n";
+     print $seqcount.' seqs, avg. length: '.$avglen."(max: $maxlen, min: $minlen)\n";
+ }
+if ($genomeLen) {
+ @arr = sort {$b <=> $a} @arr;
+ my $n50;
+ my $L50;
+ foreach my $v (@arr) {
+     $n50+=$v;
+     $L50++;
+     if($n50 >= $genomeLen/2){
+         print "N50 = $n50 and N50 value is $v (L50 = $L50)\n";
+         last;
+     }
+ }
+}

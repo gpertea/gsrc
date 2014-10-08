@@ -1,0 +1,18 @@
+#!/bin/tcsh -f
+if ("x"$1 == 'x-h') then
+ echo "Usage: fqcount [-M] <fastq_input>"
+ echo ""
+ echo "Count the number of reads in a fastq file"
+ echo ""
+ echo "Use -M to get the 'real' count if the duplicate reads were collapsed" 
+ echo "and reads have the '_xN' suffix"
+ exit 1
+ endif
+if ( "x"$1 == 'x-M' ) then
+ shift
+ perl -e '$n=0; while (<>) { if (m/^\@/ && m/_x(\d+)$/) {$n+=$1} } print $n."\n"' $1
+ exit
+endif
+set n=`wc -l $1`
+@ n /= 4
+echo $n

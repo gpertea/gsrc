@@ -1,0 +1,181 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+use Cwd qw(realpath cwd chdir);
+use File::Basename;
+
+my $usage = q/Usage:
+
+ gridx [other_gridx_opts] -U -i <proteins.mfa> pexo_srvrun.psx <fastadb_esi_fullpath> [<port>]
+
+ Start a local exonerate server and run exonerate for each protein sequence 
+ in <proteins.mfa>, one sequence at a time.  Default port is 3834.
+/;
+umask 0002;
+#so for pvmsx to consider the task was successful, $file must be deleted!
+#============== 
+# 1 is the name of the fasta sequence input file
+# 2 is the # of sequences in ${1} should = 1 for this script
+# 3 is the slice no. being processed by sx
+# 4 is 0 if not the last file, 1 if the last file
+# 5 is the # of sequences skipped initially
+# 6 is the # of sequences to be processed (-1 = ALL)
+# 7.. user parameters
+#     1        2        3         4          5       6      7        8
+my ($qmfa, $numpass, $slice_num, $last, $skipped, $total, $esidb,  $port )=@ARGV;
+
+my $cwd=cwd();
+$cwd=~s/\/$//;
+die("$usage\n") unless $esidb;
+die ($usage."Error locating file $esidb from current directory $cwd\n")
+ unless -f $esidb;
+$port=3834 unless $port;
+my $srv="localhost:$port";
+$esidb=realpath($esidb);
+my $esidir=getFDir($esidb);
+$esidir=~s/\/$//;
+my $esifile=getFName($esidb);
+$esidir='' if (-f $esifile) && ($esidir eq $cwd);
+my $srvpid=0;
+
+startServer();
+
+open(MFA, $qmfa) || die ($usage."Error opening query file!\n");
+#my $esibase=$esifile;
+#$esibase=~s/\.esi$//i;
+#$esibase=~s/\.[trans]+$//i;
+#$esibase=~s/\.[mp]*fa*$//i;
+my $outfile=$qmfa.'.exout';
+#open(FOUT, '>'.$outfile) || die ("Error creating output file $outfile !\n");
+
+my $params = '-V 0 --model p2g --percent 20 -n 11 --showalignment no --showtargetgff yes --showvulgar no'.
+' --maxintron 450000 --seedrepeat 2 --saturatethreshold 80 --geneseed 60 -x 50 --proteinwordlen 4 '.
+q/--ryo '%ti\t%qi\tmap_end\t%r\t%ql|%qab-%qae\t%ps\t%g\t%qd\n' /;
+my $host=$ENV{'HOST'} || $ENV{'HOSTNAME'};
+($host)=($host=~m/^(\w+)/);
+my $username=$ENV{'USER'} || $ENV{'LOGNAME'};
+
+unless ($username) { $username = $ENV{'USERNAME'} || 'user'; }
+my $tmpqn=$host.'_'.$username.'_'.$$;
+my $qno=1;
+my ($qdefline, $qseq, $qseqlen, $qname);
+while (<MFA>) {
+  if (m/^>/) {
+    my $d=$_;
+    qSeqFa(); #uses $qseq, $qdefline, $qno, $outfile
+    $qdefline=$d;
+    ($qname)=($d=~m/^>(\S+)/);
+    $qseqlen=0;
+    }
+   else {
+    $qseq.=$_;
+    chomp;
+    $qseqlen+=length($_);
+    }
+}
+qSeqFa();
+close(MFA);
+kill(15, $srvpid); # sending kill signal to server
+exit 0;
+
+
+#================ SUBROUTINES ============
+
+sub getFName {
+ return basename($_[0]);
+}
+
+sub getFDir {
+ return dirname($_[0]);
+}
+
+sub qSeqFa {
+ return unless $qdefline && $qseqlen>3;
+ my $qnstr=sprintf('%06d', $qno);
+ my $qfname=$tmpqn.'_'.$qnstr.'.qfa';
+ open(QFA, '>'.$qfname) || die("Error creating tmp qry file $qfname !\n");
+ print QFA $qdefline.$qseq;
+ close(QFA);
+ my $qfout=$qfname.'.exout';
+ my $s=int($qseqlen/10);
+ if ($s<150) { $s=60; }
+   elsif ($s<250) { $s=100 }
+   elsif ($s>1000) { $s=1000 }
+ my $rparams=$params;  
+ $rparams=~s/geneseed\s+\d+/geneseed $s/;
+ my $ecmd="exonerate $rparams $qfname $srv > $qfout";
+ print STDERR ">q_$qnstr [$qname, $qseqlen] : $ecmd\n";
+ my $retry=0;
+ QRETRY:
+ if (runClient($ecmd, $qfname, $qfout)) { 
+    print STDERR "   ..ran ok, wait for connection cleanup..\n";
+    my $sl;
+    do { $sl=<SRVLOG> } until ($sl=~m/cleaning up connection/);
+    print STDERR "<q_$qnstr done.\n";
+    # append qfout to outfile
+    if (-s $qfout) {
+       system("cat $qfout >> $outfile") &&
+       die("Error at appending $qfout to $outfile !\n");
+       }
+    unlink($qfname);
+    # read the server output, otherwise it gets suspended!
+    } #no error
+   else { #error detected
+    unless (srvRunning()) { 
+        #server not alive, restart it
+        #close(SRVLOG);
+        startServer();
+        }
+    $retry++;    
+    if ($retry<2) {
+       print STDERR " ..retrying $ecmd\n";
+       sleep(5);
+       goto QRETRY;
+       }
+      else { #giving up on this slice:
+       print STDERR "Failed ($qno): $qfname vs $esifile\n";
+       }
+    }
+ $qno++;
+ $qseq='';
+ $qseqlen=0;
+ $qdefline=''; 
+ unlink($qfout);
+}
+
+sub srvRunning() {
+ my $s=`ps -h -o pid,ppid,cmd -p $srvpid`;
+ my ($pid, $ppid, $cmd)=split(' ',$s,3);
+ return ($pid==$srvpid && $ppid==$$);
+}
+
+sub runClient {
+my ($docmd, $qname, $qdel) = @_;
+my $errmsg = `($docmd) 2>&1`;
+if ($? || ($errmsg=~/Error|Segmentation|Failed|Fatal|Invalid|Abort/si)) {
+  #print STDERR "!Error at: $docmd\n";
+  print STDERR " Error detected for $qname vs $esifile\n";
+  print STDERR " Error msg : $errmsg\n";
+  unlink($qdel);
+  return 0;
+  }
+ return 1; 
+}
+
+
+sub startServer {
+ if ($esidir) {
+   chdir($esidir);
+   }
+ my $cmd='exonerate-server --proteinwordlen 4 --port '.$port.' '.$esifile;
+ print STDERR "  Starting server (in $cwd): $cmd \n";
+ $srvpid=open(SRVLOG, $cmd.' 2>&1 |');
+ do {
+   $_=<SRVLOG>;
+   print STDERR $_;
+   } until m/listening/i;
+ #close(SRVLOG); -- no good, this will wait for the process to close! 
+ if ($esidir) {
+   chdir($cwd);
+   }
+}

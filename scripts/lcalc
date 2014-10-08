@@ -1,0 +1,51 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+use FindBin;use lib $FindBin::Bin;
+
+my $usage = q/Usage:
+ lcalc [-M|-s] 
+ 
+ -L : show maximum line length
+ -l : show minimum line length
+ -s : show sum and average of all numbers found in the first column
+/;
+umask 0002;
+getopts('Llso:') || die($usage."\n");
+my ($minlen, $maxlen, $sum, $count)=(999999999,0,0,0);
+my $outfile=$Getopt::Std::opt_o;
+if ($outfile) {
+  open(OUTF, '>'.$outfile) || die("Error creating output file $outfile\n");
+  select(OUTF);
+  }
+# --
+while (<>) {
+ s/[\n\r]+//s;
+ my $len=length($_);
+ $minlen=$len if ($len<$minlen);
+ $maxlen=$len if ($len>$maxlen);
+ next if $len==0;
+ my ($n)=(m/([eE\-\+\.\d]+)/);
+ $sum+=$n if length($n)>0;
+ $count++;
+ }
+if ($Getopt::Std::opt_l || $Getopt::Std::opt_s) {
+ print "Min line length: $minlen\n";
+ }
+if ($Getopt::Std::opt_L || $Getopt::Std::opt_s) {
+ print "Max line length: $maxlen\n";
+ }
+if ($Getopt::Std::opt_s) {
+ print "$count non-empty lines found.\n";
+ my $avg=$sum/$count;
+ print "Sum : $maxlen (average: $avg)\n";
+ }
+
+# --
+if ($outfile) {
+ select(STDOUT);
+ close(OUTF);
+ }
+
+#************ Subroutines **************
+

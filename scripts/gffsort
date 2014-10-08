@@ -1,0 +1,180 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+use FindBin;use lib $FindBin::Bin;
+
+my $usage = q/Usage:
+ gffsort [-o <outfile>] [-G] [-T] [-R] <gff_files>...
+ 
+Sort the gff\/gtf records found in input <gff_files> by genomic sequence 
+(1st column) and starting coordinate (4th column) of the main gene\/mRNA 
+features. Subfeatures (exon,CDS) are kept grouped together with their parents, 
+the sorting is applied to parent features.
+
+ Options:
+   -o   the sorted output is sent to <outfile>.gff3 instead of stdout
+   -R   sort the reverse strand gff records by the end (maximum) 
+        coordinate of the main features and place them in a separate
+        output file; this requires the -o option to be present, 
+        the two output files will be called <outfile>.f.gff3 and 
+        <outfile>.r.gff3 (for forward and reverse strands separately)
+   -T   rewrite the 'track' name (2nd GFF column) for each line of
+        the output with a prefix based on the input filename
+   -G   ignore genomic sequence (1st GFF column)
+/;
+umask 0002;
+getopts('GTRxuo:') || die($usage."\n");
+my $outfile=$Getopt::Std::opt_o;
+my $revsort=$Getopt::Std::opt_R;
+die ("Error: -R option requires -o \n") if $revsort && !$outfile;
+my $no_gsort=$Getopt::Std::opt_G;
+my $ftrack=$Getopt::Std::opt_T;
+my $fltunpack=$Getopt::Std::opt_u;
+my $uflt="$0 -u"; # restore filter (unpack lines)
+unless (-x $0) {
+ die("Error: $0 must have execute permissions!\n");
+ }
+#---------- unpack filter mode: 
+if ($fltunpack)  {
+  if ($outfile) {
+      open(OUTFILE, ">$outfile") || 
+         die ("Error (in unpack filter) creating file $outfile!\n");
+      select(OUTFILE);
+      }
+    while (<STDIN>) {
+      tr/\x01/\n/;
+      print $_;
+      }
+    if ($outfile) {
+       select(STDOUT);
+       close(OUTFILE); 
+       }
+  exit;
+  # --- filter mode ends here --
+  } #unpack filter mode
+
+die($usage."\n") unless @ARGV;
+
+#--- packing and piping into sort --- 
+my $gs='';
+$gs='-k1,1' unless $no_gsort;
+
+if ($revsort) {
+ $outfile=~s/\.g[tf]f\d?$//i;
+ my $routfile=$outfile.'.r.gff3';
+ $outfile.='.f.gff3';
+ my $oe=open(ROUT, "| sort $gs -k5,5nr | $uflt -o $routfile");
+ die("Error opening sort pipe!\n") if $? || $oe==0;
+ }
+if ($outfile) {
+  my $oe=open(FOUT, "| sort $gs -k4,4n | $uflt -o $outfile");
+  die("Error opening sort pipe!\n") if $? || $oe==0;
+  }
+ else {
+  my $oe=open(FOUT, "| sort $gs -k4,4n | $uflt");
+  }
+
+my @files=@ARGV;
+foreach my $fn (@files) {
+  die("Error: file $fn not found!\n") unless -f $fn;
+  }
+foreach my $fn (@files) {
+  next unless -s $fn;
+  my $trackpre;
+  if ($ftrack) {
+    my $p=$fn;
+    $p=~s/\.\w+$//; #remove extension, if any
+    ($trackpre)=($p=~m/(\w+)$/); #track prefix to use 
+    }
+  open(GFIN, $fn) || die("Error opening file $fn !\n");
+  #-------
+  my $p_id;    #last main feature ID 
+  my $pstrand; # and strand
+  my @outbuf;
+  my ($omin, $omax); #
+  while (<GFIN>) {
+    chomp;
+    my ($gn, $track, $feat, $start, $end, $score, $strand, $frame, $attr)=split("\t",$_,9);
+    next unless $attr && ($strand eq '+' || $strand eq '-' || $strand eq '.');
+    my $lcfeat=lc($feat);
+    my $id;
+    my $gtflike=1;
+    if ($attr=~m/\bParent="?([^;"]+)/ && (index($lcfeat,'exon')<0 || $lcfeat eq 'cds')) {
+       # RNA subfeature in gff3 format (exon or CDS)
+       $id=$1;
+       }
+      elsif ($attr=~m/\bID="?([^;"]+)/) {
+       # gff3 format, possibly a parent feature
+       next if $lcfeat eq 'gene' || $lcfeat eq 'locus'; # skip extraneous high-level features in gff3
+       $id=$1;
+       $gtflike=0;
+       }
+      elsif ($attr=~m/\btranscript\w*[ =]\"?([^;"]+)/) {
+       #gtf 
+       $id=$1;
+       $attr="Parent=$id";
+       }
+      else { 
+       # jigsaw or other gtf-like GFF
+       ($id)=($attr=~m/^\"?([^;" ]+)/);
+       $attr="Parent=$id";
+       if ($feat=~m/exon/i) {
+          if ($track=~m/jigsaw/) { $feat='CDS' }
+                            else { $feat='exon'}
+          }
+       }
+    next unless $id; # shouldn't happen!
+    $track=$trackpre if $trackpre;
+    ($start, $end)=($end, $start) if $end<$start;   
+    if ($id ne $p_id) {
+       #--- ID change
+       flushgff($pstrand, \@outbuf, $omin, $omax) if $p_id;
+       $pstrand=$strand;
+       $omin=$start;$omax=$end;
+       $p_id=$id;
+       @outbuf=();
+       if ($gtflike) { #this is really true when $id ne $p_id
+           #build a parent line placeholder
+           push(@outbuf, 
+              join("\t",$gn, $track, 'mRNA', "\x81","\x82",'.',$strand,'.',"ID=$id;Name=$id"));
+           }
+           else { # even if we have a parent line, we want to set the ends
+           ($start,$end)=("\x81","\x82");
+           }
+       } # ID change
+     else { # another line under the same ID
+       $omin=$start if $start<$omin;
+       $omax=$end if $end>$omax;
+       }
+    push(@outbuf,
+           join("\t",$gn, $track, $feat, $start, $end, $score, $strand, $frame, $attr));
+   } # while reading lines
+  flushgff($pstrand, \@outbuf, $omin, $omax);
+  #-------  
+  close(GFIN);
+ } # for each input gff/gtf file
+
+
+
+##=============== SUBROUTINES ============
+sub flushgff {
+ my ($s, $ar, $min, $max)=@_; 
+ return unless @$ar>0;
+ substr($$ar[0], index($$ar[0],"\x81"), 1, $min);
+ substr($$ar[0], index($$ar[0],"\x82"), 1, $max);
+ # same as:
+ # $$ar[0]=~s/\x81/$min/;
+ # $$ar[0]=~s/\x82/$max/;
+ if ($revsort) {
+   if ($s ne '-') {
+      print FOUT join("\x01",@$ar)."\n";
+      }
+   if ($s ne '+') {
+      print ROUT join("\x01",@$ar)."\n";
+      }
+   }
+ else {
+   print FOUT join("\x01",@$ar)."\n";
+   }
+ @$ar=(); 
+}

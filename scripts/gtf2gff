@@ -1,0 +1,349 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+my $usage = q/Usage:
+ gtf2gff [-f <gff3_to_filter>] [-C] [-F] [-s <sel_gff_feature>] [-t <tracklabel>] <input_gtf>
+ 
+ Convert the provided <input_gtf> file into a gff3 file, optionally 
+ setting the second column to <tracklabel> (if -t option was used).
+
+ If -f option is given, gtf2gff will work in "filtering mode" -- 
+ the file <gff3_to_filter> will be filtered such that only transcripts
+ found in the <input_gtf> file will be included.
+ Other options:
+ -s  specify what subfeatures to keep (default: both '*exon' and 'CDS' 
+     subfeatures are kept (e.g. use '-s CDS' if you want to keep only 
+     'CDS' features)
+ -C input is assumed to be in NCBI annotation format so some cleaning\/renaming will be 
+    performed while most other attributes will be preserved (including the 
+    "gene" entries)
+ -F fix the CDS phase field (for erroneous gtf\/gff confusing phase with frame)
+/;
+umask 0002;
+getopts('FCNf:t:s:') || die($usage."\n");
+my %qtrim;
+@qtrim{'gbkey','db_xref', 'protein_id'}=(); #remove quotes for these attributes
+my ($gfflt, $ctrack)=($Getopt::Std::opt_f, $Getopt::Std::opt_t);
+my $ncbigtf=$Getopt::Std::opt_C;
+my $flipphase=$Getopt::Std::opt_F;
+my $selfeature=uc($Getopt::Std::opt_s);
+if ($gfflt) {
+  open(INGFF, $gfflt) || die("Error opening $gfflt!\n");
+  }
+my %mrnas; # mrna => [  $ctg, $strand, $geneid, $track, [@exons], [@cds], gffattr]
+my @mrnalst; # list of transcript IDs in the order they were found
+my $namedOnly=$Getopt::Std::opt_N;
+my $curID; #current "contig|geneID|transcript_id" combo
+#my @curData; # [ $ctg, $strand, $geneid, $track, [@exons], [@cds], gffattr ]
+my $lastGeneID; # last 'gene' line gene_id
+my $prevGeneID;
+my ($lastgstart, $lastgend);
+my $curChr; # current chromosome ID, flush output when this changes
+#my $myGeneID;
+my $myTrID;
+my %gids; # $geneid=> counter        to check the uniqueness of gene IDs
+my %gregs; # $geneid=> [start, end]
+my %trids; # to check/correct the uniqueness of transcript IDs
+my %loci; #gene lines to print on a contig
+my %trseen; # transcript id seen at least once in this locus
+my $isGtf;
+$isGtf=1 if $ncbigtf;
+while (<>) {
+   next if m/^\s*#/;
+   chomp;
+   my ($chr, $track, $f, $fstart, $fend, $fscore, $strand, $frame, $attrs)=split(/\t/);
+   $track=$ctrack if $ctrack;
+   $f = 'exon' if $f=~m/\-?exon$/;
+   if ($f eq 'mRNA') { #gff record start   
+       my ($transcript)=($attrs=~m/ID=([^;]+)/);
+       if ($transcript) {
+         $mrnas{$transcript}=[$chr, $strand, '', $track, [], [], $attrs];
+         }
+       }
+   next unless ($attrs && ($f eq 'exon' || $f eq 'CDS' || ($ncbigtf && $f eq 'gene')));   
+   ($fstart, $fend)=($fend, $fstart) if $fend<$fstart;
+   my ($gid)=($attrs=~m/gene_id\s+"([^"]+)/);
+   my ($trid)=($attrs=~m/transcript_id\s+"([^"]+)/);
+   if ($ncbigtf) {
+         $trid=~s/^\Q$chr://;
+         $chr=~s/\.\d+$//;
+         $gid=~s/\.\d+\:/:/;
+         if ($curChr ne $chr) { #base contig change, the input MUST be grouped at least by contig
+            writeModels() if $curChr;
+            $curChr=$chr;
+            }
+         if ($trid) { #'exon' or 'CDS' feature
+            die("Unexpected transcript id $trid for non-exon/CDS feature!\n$_\n") 
+               unless $f eq 'CDS' || $f eq 'exon';
+            $trid=$chr.':'.$trid;
+            my $mrnadata=$mrnas{$trid}; 
+            my $gidnum=$gids{$gid};
+            my $trid0=$trid;
+            if ($gidnum>1) { #could be from a different transcript in fact, with the same geneID
+               #must be from the last one announced here
+               $gid.='.gn'.$gidnum;
+               }
+            $trid=getXId($trid, $gid);
+            $mrnadata=$mrnas{$trid} if ($trid ne $trid0);
+            if ($curID ne $trid) { #transcript ID change
+                $curID=$trid0;
+                $myTrID=$trid;
+                if (!$mrnadata) { # new transcript ID for this contig
+                   #my $tridn=++$trids{$trid};
+                   #$myTrID.=".tm$tridn" if $tridn>1;
+                   my $myattrs="; ".$attrs;
+                   #parse all attributes with their values
+                   my %a;
+                   foreach my $av (($myattrs=~m/\; (\w+ "[^"]*")/g)) {
+                     my ($atr, $val)=split(' ',$av,2);
+                     #$val=~s/;?\s*Derived by automated [\w :\.]+//;
+                     $val=~tr/;/./s;
+                     $val=~s/[\,;\.:]+"$/"/;
+                     next if $atr eq 'note' && length($val)<4;
+                     $val=~tr/"//d #"
+                         if exists($qtrim{$atr});
+                     $a{$atr}=$val;
+                     }
+                   delete @a{'gene_id','transcript_id','exon_number'};
+                   my %notes;
+                   my $note=delete $a{'note'};
+                   if ($note) {
+                      my @n=split(/;\s+/);
+                      @notes{@n}=();
+                      }
+                   $myattrs=join(";", map { "$_=".$a{$_} } keys(%a));
+                   $myattrs=~s/=""/=1/g;
+                   $myattrs="Parent=$gid;".$myattrs;                   
+                   #          0      1       2          3     4=exons  5=CDS    6        7
+                   $mrnadata=[$chr, $strand, $gid, $track, [],     [],      $myattrs, \%notes];
+                   $mrnas{$myTrID}=$mrnadata;
+                   push(@mrnalst, $myTrID);
+                   }
+                 else { #has $mrnadata, seen before
+                   $gid=$mrnadata->[2];
+                   }
+                }
+            # -- now add this segment to the data
+            if ($f eq 'CDS') {
+                       if ($flipphase && $frame>0) { $frame= ($frame==1) ? 2 : 1; }
+                       push(@{$mrnadata->[5]}, [$fstart, $fend, $fscore, $frame]);
+                       #
+                       }
+               else {  push(@{$mrnadata->[4]}, [$fstart, $fend, $fscore, $frame]); } #exon
+            } # 'exon' or 'CDS'
+           else { # 'gene' feature
+            die ("Unexpected non-gene entry lacking transcript_id!\n$_\n") unless $f eq 'gene';
+            $prevGeneID=$lastGeneID;
+            $lastGeneID=$gid;
+            my $newgene=1;
+            my $gidn=++$gids{$gid};
+            if ($gidn>1) { # && !geneovlExtend($gid, $fstart, $fend)) {
+                if (!geneOvl($gid, $fstart, $fend)) { #non-overlapping duplicate
+                     $lastGeneID.='.gn'.$gidn; #separate geneID if it doesn't overlap previous
+                     }
+                  else { #overlapping duplicate, skip it
+                     $gidn=--$gids{$gid};
+                     $newgene=0;
+                     if ($gidn>1) {
+                        $lastGeneID.='.gn'.$gidn;
+                        }
+                     $loci{$lastGeneID}[3]=$gregs{$gid}[$gidn-1]->[0];
+                     $loci{$lastGeneID}[4]=$gregs{$gid}[$gidn-1]->[1];
+                     }
+                 }
+                else { #first time this gene id is seen
+                 $gregs{$gid}=[[$fstart,$fend]];
+                 }
+            $lastgstart=$fstart;
+            $lastgend=$fend;
+            if ($newgene) {
+              my $gname=$gid;            
+              $gname=~s/\Q$chr://;
+              my $myattrs="ID=$lastGeneID;Name=$gname";
+              $attrs=~s/gene_id\s+"[^;]+//;
+              $attrs=~s/\;\s*(\w+)\s+"/;$1="/g;
+              $attrs=~s/;?\s*Derived by automated [\w :\.]+//;
+              $attrs=~s/note="";//g;
+              $attrs=~s/db_xref="([^"]+)"/db_xref=$1/g;
+              $attrs=~s/=""/=1/g;
+              $attrs=~s/\.";/";/;
+              { local $/=';';chomp($attrs); }
+              $myattrs.=$attrs;
+              #print the 'gene' line:
+              $loci{$lastGeneID}=[$chr, $track, $f, $fstart, $fend, $fscore, $strand, $frame, $myattrs];
+              #print join("\t", $chr, $track, $f, $fstart, $fend, $fscore, $strand, $frame, $myattrs)."\n";
+              }
+            } #gene line
+         next;  
+         } #-- NCBI gtf processing only
+   # ------------- non NCBI gtf from here on ----
+   my ($transcript, $geneid);
+   if ($attrs=~m/transcript_id[= ]+(['"\:\w\.\|\-]+)/) {
+     $transcript=$1;
+     $transcript=~tr/"//d; #"
+     $isGtf=1;
+     }
+    elsif ($attrs=~m/Parent=(['"\:\w\|\-\.]+)/) {
+     $transcript=$1;
+     $transcript=~tr/"//d; #"
+     $isGtf=0;
+     }
+   if ($attrs=~m/gene_?id[= ]+(['"\:\w\.\|\-]+)/i) {
+     $geneid=$1;
+     $geneid=~tr/"//d; #"
+     $isGtf=1;
+     $transcript=$geneid unless $transcript;
+     }
+   
+   if (!$transcript) {
+     die("Error: cannot parse transcript name from input line:\n$_\n");
+     }     
+   #die("Errror: only one type of feature is expected in the GTF input!\n")
+   #  if ($isGtf && $curfeat && $curfeat ne $f);
+  #$curfeat=$f unless $curfeat;
+  if ($gfflt) {
+    $mrnas{$transcript}=1;
+    }
+   else { #store all data as needed;
+    next if ($selfeature && $f ne $selfeature); #for GFF files, only consider selected feature (i.e. exons, not CDS)
+    my $ld = $mrnas{$transcript};
+    if ($ld) { #existing entry
+      my $lidx=($f eq 'CDS')? 5 : 4;
+      push(@{$$ld[$lidx]}, [$fstart, $fend, $fscore, $frame]);
+      if ($geneid) {
+        $mrnas{$transcript}[2]=$geneid;
+        }
+      }
+    else { # first time seeing this locus/gene
+      #push(@loc, $transcript);    
+      #                                 0      1        2      3     4=exon lst               5 = CDS list
+      #
+      my $tr=($ctrack || $track);
+      $mrnas{$transcript} = ($f eq 'CDS') ? [$chr, $strand, $geneid, $tr, [],                                 [[$fstart, $fend, $fscore, $frame]]] :
+                                      [$chr, $strand, $geneid, $tr, [[$fstart, $fend, $fscore, $frame]],[]];
+      push(@mrnalst,$transcript);                                
+      }
+   }
+} # while input lines
+
+#write_mRNA($myTrID, \@curData) if $ncbigtf && $myTrID;
+
+if ($gfflt) {
+  while (<INGFF>) {
+    next if m/^##/;
+    my @t=split(/\t/);
+    my ($id)=($t[8]=~m/ID=(['"\:\w\|\-\.]+)/);
+    my ($parent)=($t[8]=~m/Parent=(['"\:\w\|\-\.]+)/);
+    #if ($parent)
+    #print STDERR "id='$id';parent='$parent'\n";
+    $t[1]=$ctrack if $ctrack;
+    if ($t[2] eq 'exon' || $t[2] eq 'CDS') {
+      $t[8]=~s/ID=(['"\:\w\|\-\.]+);?//;
+      $t[8]=~s/Name=(['"\:\w\|\-\.]+);?//;
+      }
+    $t[8]=~s/;?Target=.+$//;
+    $t[8]=~s/;Parent=['"\:\w\|\-\.]+// if ($t[2] eq 'mRNA');
+    print join("\t",@t) if exists($mrnas{$id}) || exists($mrnas{$parent});
+    }
+  }
+ else {
+  writeModels();
+  }
+
+#================================
+sub geneOvl {
+ my ($gid, $nstart, $nend)=@_;
+ my ($pstart, $pend)=@{$gregs{$gid}[-1]}; #last non-ovl region for this gene id
+ #if ($gid eq 'GPC_000000049:COL18A1') {
+ #   print STDERR ">>>>>> (new) [$nstart-$nend] vs  [$pstart-$pend] (prev)>>>>>>>>>>>>\n";
+ #   }
+ if ($pstart>$nend || $nstart>$pend) {
+    #non-overlapping regions
+    push(@{$gregs{$gid}},[$nstart, $nend]);
+    return 0;
+    }
+#   else {
+#overlapping, merge into the last interval
+ $gregs{$gid}[-1]->[0]=$nstart if $nstart<$pstart;
+ $gregs{$gid}[-1]->[1]=$nend if $nend>$pend;
+ return 1;
+}
+
+
+sub getXId {
+ my ($tid, $gid)=@_;
+ if ((++$trseen{$tid.'~'.$gid})==1) { #very first time this $tid is seen in this locus
+       $trids{$tid}++;#
+       }
+ my $tn=$trids{$tid};
+ $tid.='.tn'.$tn if ($tn>1);
+ return $tid;
+}
+
+sub writeModels { 
+ foreach my $m (@mrnalst) {
+   my $md=$mrnas{$m} || die ("Error: transcript $m found in list but not in hash!\n");
+   write_mRNA($m, $md);
+   } #for each stored transcript
+  %mrnas=();
+  @mrnalst=();
+ # any other extra non-mRNA loci will be written here:
+ foreach my $gid (keys(%loci)) {    
+    my $gdata=$loci{$gid};
+    $gdata->[1]='PSEUDO';
+    print join("\t",@$gdata)."\n";
+    delete $loci{$gid};
+    }
+}
+
+
+
+
+sub write_mRNA {
+  my ($l, $ld)=@_;
+  my ($ctg, $strand, $geneid, $track, $er, $cr, $gffattr) = @$ld;
+  
+  next if $namedOnly && $l eq $geneid;
+
+  my (@ex, $mstart, $mend);
+  my (@cx, $cstart, $cend);
+  if (@$er>0) {
+    @ex= sort { $main::a->[0] <=> $main::b->[0] } @$er;
+    ($mstart, $mend) = ($ex[0]->[0], $ex[-1]->[1]);
+    }
+  if (@$cr>0) {
+    @cx= sort { $main::a->[0] <=> $main::b->[0] } @$cr;
+    ($cstart, $cend) = ($cx[0]->[0], $cx[-1]->[1]);
+    }
+  my ($tstart, $tend)= ( ($mstart<$cstart) ? ($mstart||$cstart) : ($cstart||$mstart) , ($mend>$cend)?$mend : $cend );
+  my $gname=$geneid || $l;
+  my $ginfo="ID=$l;Name=$gname";
+  if ($gffattr) {
+      $gffattr=~s/ID=[^;]+;?//;
+      $gffattr=~s/Parent=[^;]+;?// unless $ncbigtf;
+      $gffattr=~s/Name=[^;]+;?//;
+      $ginfo.=';'.$gffattr if length($gffattr)>1;
+      }
+      
+  my $gdata=$loci{$geneid};
+  if ($gdata) {
+    print join("\t",@$gdata)."\n";
+    delete $loci{$geneid};
+    }
+  print join("\t", $ctg, $track, 'mRNA', $tstart, $tend, '.', $strand, 
+             '.', $ginfo)."\n";
+
+  unless ($selfeature && $selfeature eq 'CDS') {
+   foreach my $x (@ex) {
+     print join("\t", $ctg, $track, 'exon', $x->[0], $x->[1], $x->[2], $strand, 
+             $x->[3], "Parent=$l")."\n";
+     }
+   }
+
+  unless ($selfeature && $selfeature ne 'CDS') {
+   foreach my $x (@cx) {
+     print join("\t", $ctg, $track, 'CDS', $x->[0], $x->[1], $x->[2], $strand, 
+             $x->[3], "Parent=$l")."\n";
+     }
+   }
+}

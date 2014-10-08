@@ -1,0 +1,64 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+use FindBin;use lib $FindBin::Bin;
+#raw translation of btab into gff3 format
+
+my $usage = q/Usage:
+ btab2gff [-R] <btab_input> 
+
+ -R will swap roles between target and reference 
+/;
+umask 0002;
+getopts('R') || die($usage."\n");
+my $rswap=$Getopt::Std::opt_R;
+
+my %qh; 
+
+while (<>) {
+ chomp;
+ my @t=split("\t");
+ my @hsp=split('~',$t[21]);
+ my $qcov=$rswap ? '' : $t[22]; #not there unless we ran btabflt.pl
+ my @ex;
+ my $strand;
+ my ($gseqid, $qid, $qlen, $qs, $qe) = $rswap ? ($t[0], $t[5], $t[18], $t[8], $t[9]) : 
+                             ($t[5], $t[0], $t[2], $t[6], $t[7]);
+ my $qn=++$qh{$qid};
+ my $qname=$qid;
+ $qid.=".bt$qn";
+ if ($t[17] eq 'Minus') {
+   $strand='-';
+   if ($rswap) {
+      @ex= map { my @r=(m/([\d\.]+)/g);[$r[0],$r[1],$r[3],$r[2],$r[4]] } @hsp;
+      }
+     else {
+      @ex= map { my @r=(m/([\d\.]+)/g);[$r[3],$r[2],$r[0],$r[1],$r[4]] } @hsp;
+      } 
+   }
+  else {
+   $strand='+';
+   if ($rswap) {
+      @ex= map { my @r=(m/([\d\.]+)/g);[$r[0],$r[1],$r[2],$r[3],$r[4]] } @hsp;
+      }
+     else { 
+      @ex= map { my @r=(m/([\d\.]+)/g);[$r[2],$r[3],$r[0],$r[1],$r[4]] } @hsp;
+      }
+   }
+ @ex= sort { $main::a->[0] <=> $main::b->[0] } @ex;
+ ($qs, $qe)=($qe, $qs) if $qe<$qs;
+ my $attr="ID=$qid;Name=$qname;qreg=$qs-$qe|$qlen";
+ $attr.=";Cov=$qcov" if $qcov;
+ $attr.=";PID=$t[10];PSIM=$t[11];Score=$t[12]";
+ $attr.=";EValue=$t[19]" if length($t[19])>1;
+ my $descr=$rswap ? '' : $t[15];
+ if (length($descr)>2) {
+   $attr.=';descr="'.$descr.'"';
+   }
+ print join("\t",$gseqid,$t[3],'mRNA', $ex[0]->[0], $ex[-1]->[1], 
+          $t[11], $strand, '.', $attr)."\n";
+ foreach my $x (@ex) {
+  print join("\t",$gseqid,$t[3],'exon', $x->[0], $x->[1], $x->[4], $strand, '.', 
+     'Parent='.$qid.';qreg='.$x->[2].'-'.$x->[3])."\n";
+  }
+}

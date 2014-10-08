@@ -1,0 +1,94 @@
+#!/usr/bin/perl
+use strict;
+use FindBin;
+
+umask 0002;
+#the line below is needed if pvmsx is used
+# also, the error condition is set only by the presence of $file 
+#$ENV{'PATH'}=$FindBin::Bin.':'.$ENV{'PATH'};
+
+my $usage=q{
+ gridx/psx slice processing script - never use by itself.
+ 
+ Usage:
+ 
+ gridx [gridx_opts] -i <seqfile> gmap_slice.psx <gmapdb_dir>/<gmapdb> [-P] [gmap_opts]
+ 
+ Example:
+ 
+ gridx -U -p 10 -n 2000 -i seqs_to_map.fa gmap_slice.psx /szfs/szannotation/zebrafish/gmapdb/Zv6chr -P -k 0.95 -n 3
+  
+ Options:
+   if -P is used, pmap will be run instead of gmap
+   any other options except -P will be passed directly to gmap
+   (defaults are -B 2 -f 2 for batch, GFF gene format output)
+};
+
+#so for pvmsx to consider the task was successful, $file must be deleted!
+#============== 
+# 1 is the name of the fasta sequence input file
+# 2 is the # of sequences in ${1} should = 1 for this script
+# 3 is the slice no. being processed by sx
+# 4 is 0 if not the last file, 1 if the last file
+# 5 is the # of sequences skipped initially
+# 6 is the # of sequences to be processed (-1 = ALL)
+# 7 user parameter
+#     1        2        3         4          5       6    
+my ($file, $numpass, $slice_num, $last, $skipped, $total, $gmapdbpath, @otheropts)=@ARGV;
+
+
+my $dbdir=$gmapdbpath;
+my ($gmapdb) = ($gmapdbpath=~m/\/(\w+)$/);
+$dbdir=~s/\/(\w+)$//;
+die "$usage\n" unless $gmapdb && -d $dbdir ;
+
+my $log_file='log_std';
+my $err_file='err_log';
+open(STDERR, '>>'.$err_file);
+open(STDOUT, '>>'.$log_file);
+my @gmapopts=grep( !/^\-?P$/, @otheropts );
+my $protsearch = $#gmapopts < $#otheropts;
+
+
+
+# my $masklc = $flags=~/M/;
+# $masklc=0 if $protsearch;
+# 
+# #my $toskip=($file =~ m/_\@(\d+)_v\d+\.\d+/) ? $1 : $skipped+$numpass*($slice_num-1);
+# my $fsrch=($masklc)? $file.'_msk.fa' : $file;
+# my $ftrimcoords=$file.'_msk.trim';
+# if ($masklc) {
+#  my $prepcmd="mdust -v32 -mN < $file | trimpoly -n20.00 -o $fsrch > $ftrimcoords";
+#  &runCmd($prepcmd);
+#  }
+my $fsrch=$file;
+
+my $cmd=$protsearch?'pmap':'gmap';
+my $gmap_res=$file.".$cmd.gff3";
+my $gmapopts=join(' ',@gmapopts);
+my $defopts=($gmapopts=~m/\-B\s*\d/) ? '' : '-B 2';
+$defopts.=($gmapopts=~m/\-f\s*\d/) ? '' : ' -f 2';
+$defopts.=' -Y';
+$cmd.=" -D $dbdir -d $gmapdb $defopts $gmapopts $fsrch > $gmap_res";
+my $slno=sprintf("slice:%09d",$slice_num);
+print STDERR ">>$slno: $cmd\n";
+&runCmd($cmd, $gmap_res);
+
+print STDERR "<<$slno: done.\n";
+
+unlink($file);
+unlink($fsrch);
+exit 0;
+
+sub runCmd {
+my ($docmd, @todel) = @_;
+my $errmsg = `($docmd) 2>&1`;
+if ($? || ($errmsg=~/ERROR/si) || ($errmsg=~/Segmentation/si) || ($errmsg=~/Failed/s) || $errmsg=~/Invalid/s) {
+  print STDERR "!Error at:\n$docmd\n";
+  print STDERR "$errmsg\n";
+  foreach (@todel) {
+    unlink($_);
+    }
+  exit(1);
+  }
+}

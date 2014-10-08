@@ -1,0 +1,45 @@
+#!/bin/tcsh -f
+if ("x"$1 == "x") then
+  echo "Add an existing source subdirectory to bioinformatics.org svn:\n $SVNBIO"
+  echo "Usage:\n svn-bio_add_dir <existing_dir>"
+  echo "(must be in the parent directory of <existing_dir>)"
+  exit 1
+endif
+set d=""
+if ( $1 == "." ) then
+  set d=$cwd:t
+  cd ..
+else
+ set d=$1
+endif
+cd $d
+if ( $status > 0 ) then
+  echo "Directory $d not found!"
+  exit 1
+  endif
+
+if ( -d .svn-bio ) then
+ echo "It seems that you already added $d to bioinformatics.org SVN"
+ exit 1
+endif
+set dn=$cwd:t
+set dp=$cwd:h
+svn mkdir $SVNBIO/$dn
+if ($status != 0) then
+ echo "Error at svn mkdir $SVNBIO/$dn !"
+ exit 1
+endif
+set dntmp=".$dn"_tmp$$
+svn co $SVNBIO/$dn /tmp/$dntmp
+#rm -rf $d/.svn $d/*/.svn $d/*/*/.svn $d/*/*/*/.svn
+mv /tmp/$dntmp/.svn .svn-bio
+/bin/rm -rf /tmp/$dntmp
+
+if (! -d .svn-bio) then
+   mv .svn .svn-bio
+   ln -s .svn-bio .svn
+   endif
+#svn add Makefile
+echo "Now go in $d and use 'svn-bio add ..' with the files you want"
+echo " and 'svn-bio commit' when ready."
+

@@ -1,0 +1,165 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+
+my $usage = q/Usage:
+exonerate ... --showalignment no --showvulgar no -n 11 --showtargetgff yes\
+  --ryo '%ti\t%qi\tmap_end\t%r\t%ql|%qab-%qae\t%ps\t%g\t%qd\n' \
+ | fltexonerate [-p <minpid>] [-c <mincov%>] 
+             
+ This is meant to convert exonerate's custom duplex output (gff + ryo)
+ to a specific gff3 output which includes query coverage (Cov=..) and 
+ percent identity (PID=) attributes
+ /;
+getopts('p:c:') || die($usage."\n"); 
+ 
+my ($mincov, $minpid)=($Getopt::Std::opt_c, $Getopt::Std::opt_p);
+$mincov=~tr/%//d;
+$mincov=1 unless $mincov;
+$minpid=20 unless $minpid;
+
+my ($tgt, $qry, $gstart, $gend, $gscore, $gstrand, $qreg, $gpid, $grank, $gdef, $qProt, $qldiv, $qcov, $qlen);
+my @exons;
+my @simdata;
+my @cds;
+my @qxgaps;
+my @aln; #align segs on genomic
+while (<>) {
+ next if m/^#/ || m/^\*\*/;
+ chomp;
+ my @t=split(/\t/);
+ my $fea=lc($t[2]);
+ if ($fea eq 'gene') {
+   flushgff() if $qry;
+   ($qProt, $qldiv)=($t[1]=~m/protein2/)? (1,3):(0,1);
+   ($qry)=($t[8]=~m/sequence\s+(\S+)/);
+   $tgt=$t[0];
+   ($gstart, $gend, $gscore, $gstrand)=@t[3..6];
+   next;
+   }
+ if ($fea eq 'exon') {
+   push(@exons, [$t[3], $t[4]]);
+   }
+  #elsif ($fea eq 'splice3') {
+  # }
+  #elsif ($fea eq 'splice5') {
+  # }
+  elsif ($fea eq 'cds') {
+   push(@cds, [$t[3], $t[4]]);   
+   }
+  elsif ($fea eq 'similarity') {
+   #print STDERR $t[8]."\n";
+   #intervals on query can be parsed here -- get the coverage
+   #-- all ungapped alignment blocks are given here
+   my @ad=($t[8]=~m/; Align (\d+ \d+ \d+)/g); # get all blocks
+   @simdata=map { [(split(/ /))] } @ad ;   
+   $qcov=0;
+   my $cs=1;
+   if ($gstrand eq '-') {
+      $cs=-1;
+      map { $_=[$_->[0]-1 ,$_->[1], $_->[2]-2, $_->[2]] } @simdata;
+      }
+     else {
+      map { $_=[$_->[0] ,$_->[1], $_->[2], $_->[2]] } @simdata;
+      } 
+   #print STDERR "===> qry intervals:";
+   my $i=0;
+   foreach my $a (@simdata) {
+     my ($s0, $q0, $sal, $qal)=@$a;
+     $a=[$s0, $s0+$cs*$sal-1, $q0*$qldiv, $q0*$qldiv+$qal-1];
+     $qcov+=$a->[3]-$a->[2]+1;
+     $a->[2]=int($a->[2]/$qldiv);
+     $a->[3]=int($a->[3]/$qldiv);
+     #print STDERR " $$a[0]-$$a[1]|$$a[2]-$$a[3] ";
+     #push(@aln, [$s0,$s0+$sal+1,$a->[2], $a->[3]]);
+     if ($i>0) {
+        if ($a->[2]-$simdata[$i-1]->[3]>4) {
+         my @gx=($simdata[$i-1]->[1], $a->[0]);
+         ($gx[0],$gx[1]) = ($gx[1],$gx[0]) if $gx[0]>$gx[1];
+         push(@qxgaps, [@gx]) if $gx[1]-$gx[0]>20;
+         #print STDERR "\nqxgap: ".$gx[0]." - ". $gx[1]."\n";
+         }
+       } 
+     $i++;     
+     }
+   $qcov/=$qldiv;  
+   #print STDERR " ===================== \n";
+   #foreach my $a (@ad) {
+   #  my ($s0, $q0, $al)=split(/ /,$a);
+   #  $qcov+=$al/$qldiv;
+   #  }
+   }
+  elsif ($fea eq 'map_end') {
+   $grank=$t[3];
+   $gpid=$t[5];
+   $gdef='';
+   if ($t[7]) {
+      ($gdef, undef)=split(/[\x01\;]/, $t[7],2);
+      }
+   my $qstrand=$t[6]; #query strand.. always '+' for protein query
+   ($qlen, my $qstart, my $qend)=($t[4]=~m/^(\d+)\|(\d+)\-(\d+)/);   
+   if ($qlen) {
+    $qstart++;
+    ($qstart, $qend)=($qend, $qstart) if $qstart>$qend;
+    #$gcov=sprintf('%.1f',(100.00*($qend-$qstart+1))/$qlen );
+    $qreg="$qstart-$qend|$qlen";
+    }
+   }
+}
+
+flushgff() if $qry;
+
+sub flushgff {
+#-- flush buffer
+my $parent=$qry.'.m'.$grank;
+
+my $gffattr='ID='.$parent;
+$gffattr.=';Score='.$gscore if $gscore;
+$qcov = ($qlen && $qcov) ? sprintf('%.1f',(100.00*$qcov)/$qlen) : 0;
+if ($qcov) {
+ goto CLEANUP if $qcov<$mincov;
+ $gffattr.=';Cov='.$qcov if $qcov;
+ }
+$gffattr.=';qreg='.$qreg if $qreg;
+if ($gpid) {
+ goto CLEANUP if $gpid<$minpid;
+ $gffattr.=';PID='.$gpid;
+ }
+else { $gpid='.'; } 
+@exons= sort { $main::a->[0] <=> $main::b->[0] } @exons;
+@cds= sort { $main::a->[0] <=> $main::b->[0] } @cds;
+#@simdata = sort { $main::a->[0] <=> $main::b->[0] } @simdata;
+if (@qxgaps>0) {
+ @qxgaps = sort { $main::a->[0] <=> $main::b->[0] } @qxgaps;
+ my @qxg= map { $_->[0].'-'.$_->[1] } @qxgaps;
+ $gffattr.=';QXGap='.join(',',@qxg);
+ }
+$gffattr.=';descr="'.$gdef.'"' if $gdef;
+
+print join("\t", $tgt, 'exonerate', 'mRNA', $gstart, $gend, $gpid, 
+                 $gstrand, '.', $gffattr)."\n";
+my $i=0;
+foreach my $ed (@exons) {
+ #unless ($simdata[$i]) {
+ # die("Error: undefined simdata($i) for parent=$parent, tgt=$tgt\n");
+ # }
+ #my ($g1, $g2, $q1, $q2)=@{$simdata[$i]};
+ my $attrs='Parent='.$parent;
+ #$attrs.=";galn=$g1-$g2;qreg=$q1-$q2";
+ print join("\t", $tgt, 'exonerate', 'exon', $$ed[0], $$ed[1], '.', 
+                 $gstrand, '.', $attrs)."\n";
+ $i++;
+}
+
+foreach my $cd (@cds) {
+ print join("\t", $tgt, 'exonerate', 'CDS', $$cd[0], $$cd[1], '.', 
+                 $gstrand, '.', 'Parent='.$parent)."\n";
+}
+CLEANUP:
+#-- reset buffer
+($tgt, $qry, $gstart, $gend, $gscore, $qcov, $gpid, $qlen, $qreg)=('', '', 0,0,0,0,0,0,0);
+@exons=();
+@simdata=();
+@qxgaps=();
+@cds=();
+}

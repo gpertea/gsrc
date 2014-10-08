@@ -1,0 +1,111 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+use POSIX "sys_wait_h"; # mostly for the handy uname() function
+
+my $usage = q/Usage:
+ qexo_p2g [-o <output.gff3>] {-q '<qprotname>' | -m <ctgname>:<hitmap_fadb.cidx>}
+          [-c <mincov> -p <minpid>] {qprot.fa|protdb.cidx} genomic.fa
+ If <qprot.fa> is a multifasta file then exonerate p2g will be run for each of the 
+ proteins in that file.
+ The output is converted to gff and optionally appended to file <output.gff3>
+ (if -o is not given, the gff output is sent to stdout)
+ /;
+
+umask 0002;
+getopts('Do:m:n:c:p:q:') || die($usage."\n");
+#die($usage."\n") unless -f $ARGV[1];
+my ($fappend, $qpull)=($Getopt::Std::opt_o, $Getopt::Std::opt_q);
+my ($mincov, $minpid)=($Getopt::Std::opt_c,$Getopt::Std::opt_p);
+$mincov=1 unless $mincov;
+$minpid=10 unless $minpid;
+my $debug=$Getopt::Std::opt_D;
+my ($hitmapdta)=($Getopt::Std::opt_m);
+my ($ctg, $hitmapcidx);
+if ($hitmapdta) { ($ctg, $hitmapcidx)=split(/:/,$hitmapdta); }
+my $numaln=1; # ID suffix for each mapping
+my $pulling=0; # temporary qry file created through db pulling
+my ($qf, $sfile)=@ARGV;
+die("$usage\n") unless $qf && $sfile;
+die("$usage Error: cannot locate query file ('$qf')!\n") unless -f $qf;
+die("$usage Error: cannot locate genomic fasta file ('$sfile')!\n") unless -f $sfile;
+my $host=lc((&POSIX::uname)[1]);
+my $counter=time();
+chomp($host);
+($host)=($host=~m/^([\w\-]+)/);
+my $qrf=getfname($qf);
+my $gfn=getfname($sfile);
+my $pnum=$ENV{GRID_TASK} || $counter;
+my $qfexo='exop2g.'.$host.'_'.$$.".$pnum.$qrf.$gfn";
+my $qfexout=$qfexo.'.exo';
+if ($qpull || $ctg) {
+  $pulling=1;
+  #my $qrf=$qf;
+  #$qrf=$1 if $qf=~m/\/([^\/]+)$/;
+  #$qrf=~s/\.cidx$//;
+  my $qfqry=$qfexo.'.qry';
+  if ($qpull) { #just pull one protein sequence
+     my $r=system("cdbyank -a '$qpull' $qf > $qfqry");
+     }
+   else { # pull a set of proteins -- in two steps  
+     die("Error: the hitmap cdb index not found!\n") unless -f $hitmapcidx;
+     my $r=system("cdbyank -a '$ctg' $hitmapcidx | cdbyank $qf > $qfqry");
+     }
+  runExonerate($qfqry);
+  }  
+ else {
+  runExonerate($qf, $qfexout);
+  }
+
+sub runExonerate {
+  my ($qfqry, $fexout)=@_;
+  print STDERR ("Warning: 0 length protein input, mistake?\n") unless -s $qfqry;
+  #my $CDSextracted;
+  #write sequence to a tmp file for searching
+  $fexout=$qfqry.'.exo' unless $fexout;
+  # use exonerate.icc ?
+  my $cmd="exonerate $qfqry $sfile -V 0 --model p2g --percent 20 -n 20 --showalignment no --saturatethreshold 80 ".
+ "--ryo '".'%ti\t%qi\tmap_end\t%r\t%ql|%qab-%qae\t%ps\t%g\t%qd\n'."' --geneseed 60 -x 50 --proteinwordlen 4 ".
+ "--seedrepeat 2 -i -40 -M 512 --showtargetgff yes --showvulgar no > $fexout ";
+  
+  #$cmd.=' >> '.$fappend if ($fappend);
+  my $r=system($cmd);
+  if ($r) {
+    die("Error at running: \n $cmd\n");
+    }
+   else { 
+    if ($fappend && -s $fexout) {
+       my $excat=$fappend;
+       $excat=~s/\.gff\d*$//i;
+       $excat.='.exout';
+       system("cat $fexout >> $excat");
+       system("fltexonerate -c $mincov -p $minpid < $fexout >> $fappend");
+       unlink($fexout);
+       }
+    unlink($qfqry) if $pulling && !$debug;
+    }
+}
+
+#------------
+sub runCmd {
+my ($docmd, @todel) = @_;
+my $errmsg = `( $docmd ) 2>&1`;
+my $errcode=$?;
+my @cores=<core.*>;
+if ($errcode || @cores>0 || ($errmsg=~/error|segmentation|violation/si) || ($errmsg=~/\bfail/si)) {
+  print STDERR "!Error at:\n$docmd\n";
+  print STDERR "$errmsg\n";
+  foreach (@todel) {
+    unlink($_);
+    }
+  exit(1);
+  }
+}
+
+sub getfname {
+ my $f=$_[0];
+ $f=$1 if $f=~m/\/([^\/]+)$/;
+ $f=~s/\.cidx$//;
+ $f=~s/\.\w+$//;
+ return $f
+}

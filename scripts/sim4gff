@@ -1,0 +1,119 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+
+my $usage = q/Usage:
+ sim4cc qfile dbfile | sim4gff [-p <minpid>] [-C] [-c <mincov>] [-f {exon|CDS}]
+             
+ This is meant to work only on the default (A=0) sim4cc output, 
+ preferrably on the fly (pipe sim4cc into this script).
+ Expects the query fasta file to be present so the 
+ definition line can be extracted.
+ 
+ Option -C enforces the assumption that the query file is a CDS\/mRNA which is already
+ properly oriented (forward strand, and this is used to determine the feature strand 
+ on the genomic sequence (necessary for one-exon features).
+ /;
+umask 0002;
+getopts('Cf:c:p:') || die($usage."\n");
+my ($mincov, $minpid, $outfeat, $coding)=($Getopt::Std::opt_c, $Getopt::Std::opt_p,
+          $Getopt::Std::opt_f, $Getopt::Std::opt_C);
+
+$mincov=1 unless $mincov;
+$minpid=20 unless $minpid;
+my $numaln=1; # suffix for each alignment
+
+my ($qfile, $qname, $qlen, $sfile, $sname, $slen, $strand);
+my @ex; # [start, end, pid, tstart, tend]
+my $complement; # target aligned as rev complement
+$outfeat='exon' unless $outfeat;
+while (<>) {
+ if (m/^seq1 = (\S+)\,\s+(\d+)\s+bp/) {
+  my ($file, $ql)=($1,$2);
+  writeprev() if @ex>0;
+  ($qfile, $qlen)=($file, $ql);
+  $_=<>;
+  ($sname, $slen) = (m/seq2 = \S+ \(([^\)]+)\)\, (\d+) bp/);
+  die ("Error parsing seq2 info!\n") unless $sname && $slen>5;
+  next;
+  }
+ chomp;
+ next if length($_)<3;
+ if (m/^\(complement\)/) {
+  $complement=1;
+  $strand='-' if $coding;
+  next;
+  }
+ if (m/^(\d+)\-(\d+)\s+\((\d+)\-(\d+)\)\s+(\d+)\%\s*([\<\-\>]*)/) {
+   my ($t1,$t2, $s1, $s2, $pid, $arrow)=($1,$2,$3,$4,$5,$6);
+   if ($arrow && !$strand) {
+     $strand=($arrow eq '<-') ? '-' : '+';
+     }
+   push(@ex, [$s1, $s2, $pid, $t1, $t2]);
+   }
+}
+
+writeprev() if @ex>0;
+
+#----------------------------
+sub writeprev {
+ #try to open the qfile to get the defline
+ my ($qdesc, $gname);
+ unless($strand) {
+  #deciding the "coding" strand for single-exon mappings is tricky, 
+  #for RefSeq the default should be:
+  $strand = $complement ? '-' : '+';
+  }
+ my ($cds_start, $cds_end);
+ if (open(QFILE, $qfile)) {
+   my $ql=<QFILE>;
+   ($qname, $qdesc)=($ql=~m/^>(\S+)\s*(.*)/);
+   die ("Cannot parse qry name from first line of $qfile :\n$ql\n") unless $qname;
+   #see if we can pull the CDS to run the alignment again
+   #if ($qdesc=~m/CDS[:=](\d+)\-(\d+)/) {
+   #  ($cds_start, $cds_end)=($1,$2);
+   #  }
+   if ($qdesc=~/gene[:=](\S+)/) {
+     $gname=$1;
+     }
+   close(QFILE);
+   }   
+ # compute overall pid & coverage
+ my ($qcov, $qmatch)=0;
+ my ($smin, $smax)=($slen,1);
+ foreach my $x (@ex) {
+  my ($s1, $s2, $pid, $t1, $t2)=@$x;
+  $qcov += $t2-$t1+1;
+  $qmatch += (($t2-$t1+1)*$pid)/100;
+  $smin=$s1 if $s1<$smin;
+  $smax=$s2 if $s2>$smax;
+  }
+ my $qscore=int($qmatch); 
+ my $qpid=sprintf('%d',($qmatch*100)/$qcov); # % matches 
+ $qcov=sprintf('%d', ($qcov*100)/$qlen); # % query coverage
+ my $qid=$qname.'.sim'.$numaln;
+ $numaln++;
+ if ($qpid>=$minpid && $qcov>=$mincov) {
+   #--- write gff data:
+   #my $tsense=($complement && ($strand ne '-')) ? '-' : '+';
+   my $tsense=$complement ? '-' : '+';
+   $gname=$qname unless $gname;
+   my $gffattr="ID=$qid;Name=$gname;Cov=$qcov;PID=$qpid";
+   $gffattr.=";Score=$qscore" if $qscore;
+   $gffattr.=";Info=\"$qdesc\"" if $qdesc;
+   print join("\t", $sname, 'sim4cc', 'mRNA', $smin, $smax, $qpid, $strand, '.', 
+                $gffattr)."\n";
+   foreach my $x (@ex) {
+     my ($s1, $s2, $pid, $t1, $t2)=@$x;
+     print join("\t", $sname, 'sim4cc', $outfeat, $s1, $s2, $pid, $strand, '.', 
+                "Parent=$qid;Target=$qname $t1 $t2 $tsense")."\n";
+
+     }
+   }
+ # -- reset vars
+ $qlen=0;
+ ($qname, $qfile, $sname, $slen, $strand, $complement)=
+  (undef,  undef,  undef, undef, undef,   0);
+ @ex=();
+ $complement=0;
+}

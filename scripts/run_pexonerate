@@ -1,0 +1,15 @@
+#!/bin/tcsh -f
+if ( $2'x' == 'x' ) then
+ echo "Usage: \nrun_pexonerate <prot_fasta> <genomic_seq_fasta> [<output_gff>]"
+ exit
+endif
+
+set excmd='exonerate     -V 0 --model p2g --percent 20 -n 11 --showalignment no --showtargetgff yes --showvulgar no'
+set excmd="$excmd --maxintron 450000 --seedrepeat 2 --ryo "'%ti\t%qi\tmap_end\t%r\t%ql|%qab-%qae\t%ps\t%g\t%qd\n'
+set excmd="$excmd --geneseed 60 -x 50 --proteinwordlen 4 --saturatethreshold 80 $1 $2"
+
+if ( $3'x' == 'x' ) then 
+ $excmd
+else
+ $excmd | fltexonerate -c70 -p70 > $3
+endif

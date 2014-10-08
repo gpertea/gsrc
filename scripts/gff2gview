@@ -1,0 +1,440 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+# -- we should also write the minimap image:
+use GD;
+
+my $usage = q/Usage:
+ gff2gview [-d <output_dir>] [-o <output_basename>] [-i 'proj_description'] 
+           [-w <img_width>] [-s <sep_dist>] [-l <reservedTracks>] [-T] [-I] \
+           <tracks.def> <genomic_seq.fa> <input_gff>
+
+ Processes the input files and produces a set of "project" files 
+ suitable for web display within the annotation viewer (gview)
+
+ Use the -I option if the first column in the gff input contains a special
+ "node ID" that should be used for URL redirection.
+
+ Use the -T option to avoid generating the tracks file (useful when
+ the track definition file is shared).
+
+ Requirements:
+ 
+  <tracks.def> contains ordered track info, each line with the space 
+    delimited fields: <gff_trackID> <hex_color> <display_name> <redirect URL>
+  
+  The <input_gff> file should specify in the second column the track ID
+  for each feature (and it must match a <gff_trackID> from the 
+  <tracks.def> file).
+  
+  Overlapping features of the same type (i.e. from the same track) are 
+  limited to <max_ovl> entries per track (default <max_ovl>=5, i.e. 
+  at most 5 overlapping features of the same type will be kept for a locus)
+/;
+
+umask 0002;
+getopts('TId:l:s:i:w:m:o:') || die($usage."\n");
+my $outdir=$Getopt::Std::opt_d || '.';
+my $maxOvl=$Getopt::Std::opt_m || 5;
+my $useNodeID=$Getopt::Std::opt_I;
+my $notrackout=$Getopt::Std::opt_T;
+my $resTracks=$Getopt::Std::opt_l;
+my $imgW=$Getopt::Std::opt_w || 648;
+my $sepDist=$Getopt::Std::opt_s || 80; # min nt distance to consider "non-overlapping" mappings
+
+my $pjinfo=$Getopt::Std::opt_i;
+$outdir=~s/\/+$//;
+#my $gene_type=$Getopt::Std::opt_g || 'mRNA';
+if ($outdir ne '.' && !-d $outdir) {
+ mkdir($outdir, 0775) || die("Error creating directory $outdir\n");
+ }
+
+my $ftrackdef=shift(@ARGV);
+
+my $fasta=shift(@ARGV);
+die("$usage\nError gettting the input files. Please check parameters.\n") 
+   unless $ARGV[0] && -f $fasta && -f $ftrackdef;
+my $defoutname;;
+if ($ARGV[0] eq '-') {
+  shift(@ARGV);
+  $defoutname='gff2gview_stdin';
+  }
+  else {
+  $defoutname=$ARGV[0];
+  $defoutname=~s/\.\w+$//; #remove extension if any
+  }
+my $outbase=$Getopt::Std::opt_o || $defoutname;
+
+#-- read tracks:
+
+open(TRDEF, $ftrackdef) || die ("Error opening track file $ftrackdef ($!)\n");
+my %trackOrd;
+my %trackCol; #track colors
+my $tord=0;
+my @tlines;
+while (<TRDEF>) {
+ next if m/^\s*#/;
+ push(@tlines, $_);
+ chomp;
+ $tord++;
+ my @t=split;
+ $trackOrd{$t[0]}=$tord;
+ $trackCol{$t[0]}=$t[1];
+ }
+close(TRDEF);
+unless ($notrackout) {
+ #unless (-s "$outdir/$outbase.tracks") {
+   open(TRW, ">$outdir/$outbase.tracks") || die("Error creating file $outdir/$outbase.tracks");
+   print TRW join('',@tlines);
+   close(TRW);
+ #  }
+}
+#--- write the sequence file:
+open(FSEQ, $fasta) || die("Error opening $fasta\n");
+
+open(GSEQ, ">$outdir/$outbase.seq") || die("Error creating file $outdir/$outbase.seq");
+my $gseqlen=0;
+my $gseqid;
+while (<FSEQ>) {
+  next if m/^\s*#/;
+  if (m/^>(\S+)/) {
+    $gseqid=$1;
+    if (!$pjinfo && m/^>\S+\s+(.+)/) {
+      $pjinfo=$1;
+      }
+    next;
+    }
+  chomp;
+  s/[\r\s]+$//s;
+  $gseqlen+=length($_);
+  print GSEQ $_;
+  }
+close(GSEQ);
+close(FSEQ);
+
+#-------------
+
+
+#                         0          1       2     3       4        5        6               7            8     
+my %map; # mapID => [  $track,  $strand,  $start, $end,   $fname,  $descr, $subf_name,  $subf_listref, $cluster ]
+
+my $mcount=0;
+#                         0         1         2     3       4
+my @mlist; # list of [ $mapID, $tracknum, $start, $end, $stackpos ];
+my $gdescr;
+my $firstfeat;
+
+while (<>) {
+   next if m/^\s*#/;
+   chomp;
+   my ($chr, $ftrack, $f, $fstart, $fend, $fscore, $strand, $frame, $attrs)=split(/\t/);   
+   next unless $attrs;
+   $f='exon' if ($f =~m/\-exon$/);
+   my ($fid)=($attrs=~m/ID\s*=\s*"?([^;"]+)/);
+   my ($fp)=($attrs=~m/Parent\s*=\s*"?([^;"]+)/);
+   next unless $fid || $fp;
+   ($fstart, $fend)=($fend, $fstart) if $fend<$fstart;
+   if ($fend>$gseqlen) {
+     die("Error: coordinate of feature $fid  ($fend) is beyond the length of genomic sequence ($gseqlen)\n");
+     }
+   my $tracknum=$trackOrd{$ftrack};
+   unless ($tracknum) {
+    print STDERR "Warning: skipping feature $fid with unknown track '$ftrack'\n";
+    next;
+    }
+   my $m=$map{$fid};
+   ##----------- child
+   if ($fp) { #child feature
+     my $pm=$map{$fp};     
+     if (!$pm || ($pm->[6] && $pm->[6] ne $f)) {
+       print STDERR "Warning: subfeature $f ($fstart-$fend) of $fp discarded.\n";
+       next;
+       }
+     $pm->[6]=$f;
+     push (@{$pm->[7]}, [$fstart, $fend, $fscore]);
+     }
+   ##----------- parent 
+   else { # 1st level parent feature
+     if ($m) { #existing parent feature.. duplicates not allowed
+        print STDERR "Warning: skipping repeat of parent feature $fid (why non-unique?)\n";
+        next;
+        }
+     my $gdescr;
+     # try to parse the description/annotation, if any
+     if ($attrs=~m/Info\s*=\s*"?([^;"]+)/i) {
+          $gdescr=$1;
+          }
+         elsif ($attrs=~m/Descr?\s*=\s*"?([^;"]+)/i) {
+          $gdescr=$1;
+          }
+         elsif ($attrs=~m/TopHit\s*=\s*"?([^;"]+)/i) {
+          $gdescr=$1;
+          }
+         elsif ($attrs=~m/BestHit\s*=\s*"?([^;"]+)/i) {
+          $gdescr=$1;
+          }
+         elsif ($attrs=~m/Name\s*=\s*"?([^;"]+)/) {
+          $gdescr=$1;
+          }
+     if ($gdescr) {
+       $gdescr=~s/^\s+//;$gdescr=~s/\s+$//;
+       $gdescr='' if index(lc($fid),lc($gdescr))>=0;
+       }
+     
+     my $fullID = ($useNodeID) ? $fid.'|nid:'.$chr : $fid;
+     #                 0       1        2       3     4     5     6    7     8     9     10       11
+     $map{$fid}= [ $ftrack, $strand, $fstart, $fend, $f, $gdescr, '', [], [$fid],  0,  $fscore, $fullID ];
+
+     #                0       1         2       3     4
+     push(@mlist, [ $fid, $tracknum, $fstart, $fend,  0 ]);
+     $mcount++;
+     } #parent feature
+} #while <GFF>
+
+# sort mlist by fstart coordinate
+#print STDERR "Sorting features by start coordinate..\n";
+
+@mlist=sort { $main::a->[2]<=>$main::b->[2] } @mlist;
+
+#---- cluster mappings by overlap
+#print STDERR "Clustering features by virtual overlap..\n";
+
+my %clusters; #cl => [mapID1, mapID2, ...]
+for (my $a=0;$a<$mcount; $a++) {
+  for (my $b=$a+1;$b<$mcount;$b++) {
+    my ($ma, $mb)=($map{$mlist[$a]->[0]}, $map{$mlist[$b]->[0]});
+    my ($macl, $mbcl)=($ma->[8], $mb->[8]);
+    last if ($$mb[2] > $$ma[3]+$sepDist);
+    next if ($mbcl==$macl);
+    if (hasOverlap($$ma[2], $$ma[3], $$mb[2], $$mb[3])) {
+      if ($macl && $mbcl) {
+         my $mergecl=mergeClusters($macl, $mbcl);
+         }
+      }
+    }
+  }
+my $ncl=keys(%clusters);
+#print STDERR "Computing stack ordering for each of the $ncl clusters..\n";
+
+my $clnum=0;
+foreach my $cl (values(%clusters)) { # for each cluster
+ #                  0        1                        2            3            4
+ #                 id      trackNo               startpos      endpos         stackOrd
+ my @clist = map( [$_, $trackOrd{$map{$_}->[0]}, $map{$_}->[2],$map{$_}->[3],  0,      ], @$cl);
+ # debugShowCl(\@clist, $clnum);
+ # by track priority AND by start coordinate
+ @clist = sort byTrackOrd @clist;
+ my @rows; #$list[i] = [ list of [start, end]]  - feature coordinates placed on the same row
+ # array of maximum (rightmost) end and minimum (leftmost) start coord for each stacklevel
+ for (my $i=0;$i<@clist;$i++) {
+   #my $curtrack=$clist[$i]->[1];
+   # we can reset @rows on  track change..
+   # and set stackOrd to $lastTrackStack + $r
+   my $iseq=$clist[$i];
+   #search back for possible room
+   my $placed;
+   #print STDOUT join("\t",$$iseq[0], $curtrack, $$iseq[2])."\n";
+   #reserve rows 0 and 1 for trackNo 0 and 1
+   #reserve row 0 for track 0 (sequence gaps)
+   #my $numlocked
+   my $rstart=0;
+   if ($resTracks) {
+      $rstart= $$iseq[1]>$resTracks ? $resTracks : ($$iseq[1]>0 ? $$iseq[1]-1 : 0);
+      }
+   #my $rstart=$$iseq[1]>2 ? 2 : ($$iseq[1]==2 ? 1 : 0);
+   for (my $res=0;$res<$resTracks;$res++) { push(@rows,[]); } #reserve tracks if requested
+   for (my $j=$rstart;$j<@rows;$j++) {
+     if (canPlace($iseq, $rows[$j])) {
+        $$iseq[4]=$j;
+        $placed=1;
+        last;
+        }
+    }# for each row
+    unless ($placed) {# no more room on previous rows, create a new row
+        $$iseq[4]=scalar(@rows);
+        push(@rows, [[$$iseq[2], $$iseq[3]]]);
+        }
+   #----------------
+   #-- stack order determined for this mapping, store it!
+   $map{$$iseq[0]}->[9]=$$iseq[4];
+   } #for each gff record
+ $clnum++;  
+ @clist=();
+}
+
+
+#----------------
+
+my $maxstackpos=1;
+my %gifCol;
+open(IFA, ">$outdir/$outbase.ifa") || die ("Error creating $outdir/$outbase.ifa!\n");
+my $gifmap=new GD::Image($imgW,30);
+my $gifbkg=$gifmap->colorAllocate(unpackRGB('EAEAEA'));
+$gifmap->transparent($gifbkg);
+foreach my $t (keys(%trackCol)) {
+ my $cval=$trackCol{$t};
+ $gifCol{$t}=$gifmap->colorAllocate(unpackRGB($cval));
+ }
+my $iW=$imgW-2;
+foreach my $l (@mlist) {
+ my $m=$map{$$l[0]};
+ #     0         1       2      3    4    5         6        7     8         9       10     11
+ my ($track, $strand, $start, $end, $f, $descr, $subfname, $subf, $cl,  $stackpos, $score, $wID)= @$m;
+ if (@$subf==0) {
+   $subf=[[$start, $end, $score]];
+   $subfname=$f;
+   }
+ my @segs=sort { $main::a->[0] <=> $main::b->[0] } @$subf;
+ my @wsegs = map { $_->[0].'-'.$_->[1].
+                    (length($_->[2])>1 ? ':'.substr($_->[2],0,4) : '') } @segs;
+ $stackpos++;
+ my $tc=$trackCol{$track};
+ my $ilen=sprintf('%d',((($end-$start)*$iW)/$gseqlen)); #length of this mapping in the minimap
+ #$ilen=1 if ($ilen<1);
+ my $ipos=sprintf('%d',(($start*$iW)/$gseqlen)+1);
+ my $ypos=$stackpos+1;
+ $gifmap->line($ipos, $ypos, $ipos+$ilen, $ypos, $gifCol{$track});
+ #print IFA ">$$l[0] $start $end $strand $track $stackpos $f\n";
+ print IFA ">$wID $start $end $strand $track $stackpos $f\n";
+ print IFA "$subfname|".join(' ',@wsegs)."\n";
+ if ($descr) {
+    print IFA 'i:'.$descr."\n";
+    # if ($srchFile) {
+    #  print SRCH ">$wID $descr\n";
+    #  print SRCH "$track $strand $start $end"
+    #  }
+    }
+ $maxstackpos=$stackpos if ($stackpos>$maxstackpos);
+ }
+
+close(IFA);
+open(GIFMAP,">$outdir/$outbase.gif") 
+   || die ("Error creating $outdir/$outbase.gif !\n");
+binmode GIFMAP;
+{
+ my $gifimg=$gifmap->gif();
+ print GIFMAP $gifimg;
+}
+close(GIFMAP);
+#print STDERR "iit_store into $outdir/$outbase.iit..\n";
+system("iit_store -o $outdir/$outbase.iit < $outdir/$outbase.ifa");
+
+open(DTA, ">$outdir/$outbase.dta") || die ("Error creating file $outdir/$outbase.dta\n");
+print DTA join("\t",$gseqid, $gseqlen, $maxstackpos, $pjinfo)."\n";
+close(DTA);
+#print STDERR "Done.\n";
+
+#=============================================================
+
+
+sub debugShowCl {
+ #print STDERR ">Cluster".$_[1]."\n";
+ foreach my $cd (@{$_[0]}) {
+  my @d=@$cd;
+  my $id=shift(@d);
+  #print STDERR join(' ',sprintf('%40s',$id),(map(sprintf('%9s',$_), @d)))."\n";
+  }
+}
+
+sub mergeClusters {
+ my ($macl, $mbcl)=@_;
+ delete $clusters{$macl};
+ delete $clusters{$mbcl};
+ my $newcl=[@$macl, @$mbcl];
+ $clusters{$newcl}=$newcl;
+ foreach my $id (@$newcl) {
+   $map{$id}->[8]=$newcl;
+   }
+}
+
+sub byTrackOrd { #sort by track priority AND by start coordinate
+  if ($main::a->[1]==$main::b->[1]) { 
+     return $main::a->[2]==$main::b->[2] ? $main::b->[3]-$main::a->[3] : 
+                            $main::a->[2]-$main::b->[2] 
+     }
+    else {
+    return $main::a->[1]-$main::b->[1];
+    }
+}
+
+sub printRow {
+ my ($r)=@_;
+ my @p;
+ foreach my $s (@$r) { push(@p,"[$$s[0]-$$s[1]]") }
+ return join(' ',@p);
+}
+
+sub canPlace {
+ my ($g, $r)=@_; #gene feature, row data
+ #$r is a ref to a list of [start, end] coordinates, sorted by $start
+ if (@$r==0 || $$g[2]-$sepDist > $$r[-1]->[1]) {
+      #room to the right
+      push(@$r, [$$g[2], $$g[3]]);
+      return 1
+      }
+ if ($$g[3]+$sepDist < $$r[0]->[0]) {
+      #room to the left
+      unshift(@$r, [$$g[2], $$g[3]] );
+      return 1
+      }
+ my $rmax=@$r-1;
+ for (my $i=0;$i<$rmax;$i++) {
+   #check for room between this and next gf
+   next unless $$g[2]>$$r[$i]->[0];
+   if ( $$g[2]-$sepDist > $$r[$i]->[1]  && 
+        $$g[3]+$sepDist < $$r[$i+1]->[0]) {
+        splice(@$r, $i+1, 0, [$$g[2], $$g[3]]); #insert interval in this array
+        return 1
+        }
+   last if $$r[$i+1]->[0]>$$g[3];
+   }#for each inter-gf space
+ return 0;
+}
+
+
+sub hasOverlap {
+ my ($a1, $a2, $b1, $b2)=@_;
+ return ($a1<$b1) ? ($b1-$a2<=$sepDist) : ($a1-$b2<=$sepDist);
+}
+
+
+sub unpackRGB {
+ my $v=hex($_[0]);
+ return ( (($v & 0xFF0000) >> 16), 
+          (($v & 0x00FF00) >> 8),
+          ($v & 0x0000FF) );
+}
+
+
+sub writeModels {
+ foreach my $l (@mlist) {
+   my $ml=$map{$$l[0]} || die ("Error: mapping $$l[0] not in hash!?\n");
+   my ($tag, $trck, $er, $cr, $descr) = @$ml;
+   my $wID=$$ml[11];
+   my ($mstart, $mend, @ex, @cds); 
+   if (@$er>0) {
+     @ex= sort { $main::a->[0] <=> $main::b->[0] } @$er;
+     ($mstart, $mend) = ($ex[0]->[0], $ex[-1]->[1]);
+     }
+   if (@$cr>0) {
+     @cds= sort { $main::a->[0] <=> $main::b->[0] } @$cr;
+     ($mstart, $mend) = ($cds[0]->[0], $cds[-1]->[1]) unless $mstart;
+     }
+   
+   #print IFA ">$l $mstart $mend $tag";
+   print IFA ">$wID $mstart $mend $tag";
+   print IFA " $trck" if $trck;
+   print IFA "\n";
+   if (@ex) {
+     my @wlst = map { $_->[0].'-'.$_->[1].':'.$_->[2]  } @ex;
+     print IFA join(',',@wlst)."\n";
+     }
+   if (@cds) {
+     my @wlst = map { $_->[0].'-'.$_->[1].':'.$_->[2]  } @cds;
+     print IFA 'C:'.join(',',@wlst)."\n";
+     }
+   if ($descr) {
+     print IFA 'i:'.$descr."\n";
+     }
+  } #for each stored locus
+}

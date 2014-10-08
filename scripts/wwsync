@@ -1,0 +1,47 @@
+#!/usr/bin/perl
+use strict;
+
+my $usage=qq/
+ Usage:
+  wwsync <dir>
+  
+  Example: 
+  
+     wwsync [-d] .
+
+  ..will pull the content of the current directory 
+  from the www server (igm3)
+  <dir> can only be a relative path to the current
+  directory
+  Use the -d option if you want to DELETE the local files
+  which are not found in the source directory being synchronized,
+/;
+my $xdel='';
+die "$usage\n" if (@ARGV<1 || $ARGV[0]=~m/^\-\-?h/);
+if ($ARGV[0] eq '-d' || $ARGV[0] eq '-D') {
+ $xdel=' --delete ';
+ shift(@ARGV);
+}
+die "$usage\n" if (@ARGV!=1);
+
+my $d=$ARGV[0];
+my $host='igm3.pha.jhu.edu';
+my $tdir=$ENV{PWD};
+$tdir=~s/\/$//;
+if ($d=~m/^\//) {
+   $tdir=$d;
+   $tdir=~s/\/$//;
+   }
+ else {
+   #relative path
+   $d=~s/\/$//;
+   if ($d ne '.') {
+    $tdir.='/'.$d;
+    }
+   }
+my $sdir=$tdir;
+$sdir=~s{^/.+?/httpd/ccb}{/data1/igm3/www/ccb.jhu.edu};
+my $cmd="rsync $xdel -avzH --exclude=.svn --exclude=gage_b --exclude=salzberg -e ssh ".
+        $host.':'.$sdir."/ $tdir";
+print STDERR "Running: $cmd\n";
+system($cmd);

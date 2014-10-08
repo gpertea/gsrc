@@ -1,0 +1,254 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+#use FindBin;use lib $FindBin::Bin;
+
+my $usage = q/Usage:
+ psl2sam [-o <outfile.sam>] <psl_file> <query_fasta> <target_fasta> 
+
+ Both <query_fasta> and <target_fasta> must have 
+ been indexed with 'cdbfasta' or 'samtools faidx'
+ The psl_file must be sorted by these criteria:
+  tgtName, tgtStart
+ (e.g. sort -k14,14 -k16,16n)
+ 
+/;
+umask 0002;
+
+#----------------------
+#  0  matches int unsigned ,       # Number of bases that match that aren't repeats
+#  1  misMatches int unsigned ,    # Number of bases that don't match
+#  2  repMatches int unsigned ,    # Number of bases that match but are part of repeats
+#  3  nCount int unsigned ,        # Number of 'N' bases
+#  4  qNumInsert int unsigned ,    # Number of inserts in query
+#  5  qBaseInsert int unsigned ,   # Number of bases inserted in query
+#  6  tNumInsert int unsigned ,    # Number of inserts in target
+#  7  tBaseInsert int unsigned ,   # Number of bases inserted in target
+#  8  strand char(2) ,             # + or - for query strand, optionally followed by + or - for target strand
+
+#  9  qName varchar(255) ,         # Query sequence name
+
+# 10  qSize int unsigned ,         # Query sequence size
+# 11  qStart int unsigned ,        # Alignment start position in query
+# 12  qEnd int unsigned ,          # Alignment end position in query
+# 13  tName varchar(255) ,         # Target sequence name
+# 14  tSize int unsigned ,         # Target sequence size
+# 15  tStart int unsigned ,        # Alignment start position in target
+# 16  tEnd int unsigned ,          # Alignment end position in target
+# 17  blockCount int unsigned ,    # Number of blocks in alignment
+# 18  blockSizes longblob ,        # Size of each block in a comma separated list
+# 19  qStarts longblob ,      # Start of each block in query in a comma separated list
+# 20  tStarts longblob ,      # Start of each block in target in a comma separated list
+
+#Currently the program does not distinguish between matches and repMatches.  repMatches is always zero.
+# how coordinates are handled on the negative strand: In the qStart/qEnd fields the coordinates are 
+# where it matches from the point of view of the forward strand (even when the match is on the reverse strand). 
+# However on the qStarts[] list, the coordinates are reversed when the match is on the reverse strand 
+# (i.e. they are coordinates on the reversed query sequence). 
+
+getopts('o:') || die($usage."\n");
+my $outfile=$Getopt::Std::opt_o;
+my ($fpsl, $fqry, $ftgt)=@ARGV ;
+die "$usage\n" unless -s $fpsl && -s $fqry && -s $ftgt;
+for my $f ( ($fqry, $ftgt) ) {
+if (-s $f.'.fai') {
+ $f.='.fai';
+ }
+ elsif (-s $f.'.cidx') {
+ $f.='.cidx';
+ }
+ else {
+  die "$usage\nFile $f must be indexed with cdbfasta or 'samtools faidx'!\n";
+  }
+}
+
+#==============================================
+if ($outfile) {
+  open(OUTF, '>'.$outfile) || die("Error creating output file $outfile\n");
+  select(OUTF);
+  }
+my %ctgs; # target_seqname => [$numreads, $ctglen,  $min, $max,  $rseq]
+#                                    0      1         2     3      4
+my @readlst; #list of reads for each contig
+# each elem of readlst is like this:
+#  [rdname, orientation, len, start_coord, clipL, clipR, seg_gaps,... ]
+open (FPSL, $fpsl) || die("Error opening $fpsl file\n");
+my ($qseq, $tseq, $prevqname, $prevtname);
+#$tseq="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+my $lines=0;
+while (<FPSL>) {
+ next unless m/^\d+/;
+ $lines++;
+ #next if $lines>2;
+ chomp;
+ my @t=split(/\t/);
+ #--
+ # my ($tstart, $tend)=@t[15,16];
+ #--
+ my ($strand, $qryname, $qrylen, $qstart, $qend, $ctgname, $ctglen, $tstart, $tend)=@t[8..16];
+ my $qalnlen=$qend-$qstart+1;
+ my $pid=sprintf('%4.2f', ($t[0]*100.00)/$qalnlen);
+ ($tstart, $tend)=($tend, $tstart) if $tstart>$tend; 
+ my $blcount=$t[17];
+ my @blsizes=split(/\,/,$t[18]);
+ die "Error: block count doesn't match block size list!\n" unless $blcount==@blsizes;
+ my @qstarts=split(/\,/,$t[19]);
+ die "Error: block count doesn't match block qstart list!\n" unless $blcount==@qstarts;
+ my @tstarts=split(/\,/,$t[20]);
+ die "Error: block count doesn't match block tstart list!\n" unless $blcount==@tstarts;
+ $ctgs{$ctgname}->[0]++; #add this read to the "alignment" for this ctg
+ $ctgs{$ctgname}->[1]=$ctglen;
+ my ($pmin, $pmax)=($ctgs{$ctgname}->[2], $ctgs{$ctgname}->[3]);
+ $pmin=$ctglen unless $pmin;
+ $pmax=1 unless $pmax;
+ $pmin=$tstart+1 if ($tstart<$pmin-1);
+ $pmax=$tend if ($tend>$pmax);
+ ($ctgs{$ctgname}->[2], $ctgs{$ctgname}->[3])=($pmin, $pmax);
+ my $isRev = ($strand eq '-');
+ my ($clipL, $clipR) = ($qstart, $qrylen-$qend);
+ ($clipL, $clipR)=($clipR, $clipL) if $isRev;
+#  my @qrystarts; 
+#  if ($isRev) { #recalculate qrystarts coordinates on fwd strand
+#    my @revqst;
+#    for (my $i=0;$i<$blcount;$i++) {
+#       push(@revqst, $qrylen-($qstarts[$i]+$blsizes[$i]));
+#       }
+#    @qrystarts = @revqst;
+#    }
+#    else {
+#    @qrystarts=@qstarts;
+#    }
+ if ($qryname ne $prevqname) {
+    $qseq=&getSeq($fqry, $qryname);
+    $prevqname=$qryname;
+    }
+ if ($ctgname ne $prevtname) {
+    $tseq=&getSeq($ftgt, $ctgname);
+    $prevtname=$ctgname;
+    }
+ my $qseqfr=$qseq; #forward or reverse qry sequence, depending on strand
+ $qseqfr=revcompl($qseqfr) if $isRev;
+ #------ parse and align the blocks
+ ### print ">$qryname vs $ctgname [$strand] $blcount aln blocks ($pid\% identity):\n";
+ my ($prev_tend, $prev_qend, $qseq, $qaln, $taln);
+ if ($clipL) {
+   $qseq = uc(substr($qseqfr, 0, $clipL));
+   $qaln = lc($qseq);
+   if ($tstart<$clipL) {
+     $taln = ' ' x ($clipL-$tstart);
+     $taln .= lc(substr($tseq, 0, $tstart)) if $tstart;
+   }
+   else {
+    $taln = lc(substr($tseq, $tstart-$clipL, $clipL)); # substr(' ' x $clipL)
+   }
+ }
+ my $ti=$tstart;
+ my $qi=$clipL;
+ my ($cigar, $md);
+ $cigar=$clipL.'S' if $clipL;
+ for (my $i=0;$i<$blcount;$i++) {
+   #-- modify values for reverse $strand cases
+   #&showBlockAlign(\$qseq, \$tseq, $strand, $qrystarts[$i], $tstarts[$i], $blsizes[$i]);
+   my ($qgap, $tgap)=('','');
+   if ($i) {
+      my $qskip=$qstarts[$i]-$prev_qend;
+      my $tskip=$tstarts[$i]-$prev_tend;
+      if ($tskip>$qskip) {
+         ($qgap, $tgap)=('-' x ($tskip-$qskip), '');
+      }
+        elsif ($qskip>$tskip) {
+         ($tgap, $qgap)=('-' x ($qskip-$tskip), '');
+      }
+      if ($qskip) {
+        $cigar.=$qskip.'I';
+        $qseq.=uc(substr($qseqfr, $qi,$qskip));
+        $qaln.=lc(substr($qseqfr, $qi,$qskip));
+        $qi+=$qskip;
+      }
+      if ($tskip) {
+        my $code = ($tskip<10)?'D':'N';
+        $cigar.=$tskip.$code;
+        $taln.=lc(substr($tseq, $ti,$tskip));
+        $md.='^'.substr($tseq, $ti, $tskip);
+        $ti+=$tskip;
+      }
+      $qaln.=$qgap;
+      $taln.=$tgap;
+   }
+   my $blen=$blsizes[$i];
+   $qseq .= uc(substr($qseqfr, $qi, $blen));
+   $qaln .= substr($qseqfr, $qi, $blen);
+   $taln .= substr($tseq,   $ti, $blen);
+   # MD tag:
+   my $md_c=0;
+   for (my $i=0;$i<$blen;$i++) {
+     if (substr($qseqfr, $qi+$i, 1) eq substr($tseq,   $ti+$i, 1)) {
+       ++$md_c;
+     }
+     else {
+     $md.=$md_c.substr($tseq, $ti+$i, 1);
+     $md_c=0;
+     }
+   }
+   $md.="$md_c";
+   $qi+=$blen;
+   $ti+=$blen;
+   $cigar.=$blen.'M';
+   $prev_tend=$tstarts[$i]+$blen;
+   $prev_qend=$qstarts[$i]+$blen;
+ } #for each alignment block
+ if ($clipR) {
+   $cigar.=$clipR.'S';
+   $qseq.=uc(substr($qseqfr, $qi, $clipR));
+   $qaln.=lc(substr($qseqfr, $qi, $clipR));
+   my $trest=$ctglen-$ti-1;
+   if ($trest<$clipR) {
+     $taln.=lc(substr($tseq, $ti)) if $trest;
+   }
+   else {
+     $taln.=lc(substr($tseq, $ti, $clipR));
+   }
+ }
+ ### printf("qry %12s: %s\ntgt %12s: %s\n",$qstart+1, $qaln, $tstart+1, $taln);
+ my $flags=0;
+ $flags|=0x10 if $isRev;
+ print join("\t", $qryname, $flags, $ctgname, $tstart+1, 255, $cigar, '*', '0', '0', $qseq, '*', 'MD:Z:'.$md)."\n";
+} #for each psl line (alignment)
+
+
+foreach my $ctg (keys(%ctgs)) {
+ my $d=$ctgs{$ctg};
+ print STDERR "Contig $ctg has $$d[0] reads, $$d[1] len (covered from $$d[2] to $$d[3])\n";
+ }
+
+if ($outfile) {
+ select(STDOUT);
+ close(OUTF);
+ }
+
+#=============================================
+
+sub revcompl { #gets a DNA sequence, returns the reverse complement
+ my $rseq=reverse($_[0]);
+ $rseq =~ tr/AaCcTtGgUuMmRrWwSsYyKkVvHhDdBb/TtGgAaCcAaKkYyWwSsRrMmBbDdHhVv/;
+ return $rseq;
+}
+
+# sub showBlockAlign {
+#  my ($pseq1, $pseq2, $strand, $bstart1, $bstart2, $blen) = @_;
+#  my $qseq = ($strand=~/\-/) ? revcompl(substr($$pseq1, $bstart1, $blen)) : substr($$pseq1, $bstart1, $blen);
+#  printf("qry %12s: %s\ntgt %12s: %s\n-=-\n",$bstart1+1,$qseq,
+#                                       $bstart2+1,substr($$pseq2, $bstart2, $blen));
+# }
+
+sub getSeq {
+ my ($file, $seqname)=@_;
+ my $isFai=($file=~s/\.fai$//);
+ my $cmd=$isFai ? "samtools faidx $file '$seqname'" :
+                  "cdbyank -a '$seqname' $file" ;
+ my $seq=`$cmd`;
+ die "Error at '$cmd'\n" if ($? || length($seq)<8);
+ $seq=~s/^>[^\n]+//s; #remove defline
+ $seq=~tr/\n\r \t//d;
+ return $seq;
+}

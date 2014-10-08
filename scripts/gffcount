@@ -1,0 +1,33 @@
+#!/bin/sh
+if [ "x"$1 = "x-h" ]; then
+echo "Usage: gffcount [-g] <gff3_file>"
+echo "  Show the count of distinct mRNA names."
+echo " use -g option to count distinct gene names only (Name attribute)"
+exit 1
+fi
+if [ "x"$1 = "x-g" ]; then
+ shift
+ perl -ne 'chomp;@t=split(/\t/);print "$1\n" if $t[2]=~m/gene$/ && m/ID=([^;]+)/' $1 | sort -u | wc -l
+ exit
+fi
+
+if [ "x"$1 = "x-C" ]; then
+ shift
+ perl -ne 'chomp;@t=split(/\t/);print "$1\n" if ($t[2] eq "CDS") && m/Parent=([^;]+)/' $1 | sort -u | wc -l
+ exit
+fi
+
+if [ "x"$1 = "x-Cl" ]; then
+ shift
+ perl -ne 'chomp;@t=split(/\t/);print "$1\n" if ($t[2] eq "CDS") && m/Parent=([^;]+)/' $1 | sort -u
+ exit
+fi
+
+if [ "x"$1 == "x-l" ]; then
+ shift
+ perl -ne 'chomp;@t=split(/\t/);print "$1\n" if ($t[2]=~m/exon$/ && m/Parent=([^;]+)/)' $1 | sort -u
+ exit
+fi
+
+#perl -ne 'chomp;@t=split(/\t/);print "$1\n" if ($t[2]!~m/(?:exon|CDS|gene)$/) && m/ID=([^;]+)/' $1 | sort -u | wc -l
+perl -ne 'chomp;@t=split(/\t/);print "$1\n" if ($t[2]=~m/exon$/ && m/Parent=([^;]+)/)' $1 | sort -u | wc -l

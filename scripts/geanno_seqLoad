@@ -1,0 +1,87 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+use FindBin;use lib $FindBin::Bin;
+use dbSession;
+
+my $usage = q/Usage:
+ geanno_seqLoad -t <taxon_id> -g <genome_release_name> <fasta_file(s)...>
+ 
+ Load the given fasta file(s) with the genomic sequences into the 
+ geanno database, creating new entries in the ginfo and gseq tables 
+ as needed.
+ For each chromosome\/contig loaded, ginfo.name and ginfo.accession 
+ will be set as the sequence name found in the input fasta file(s).
+/;
+umask 0002;
+getopts('t:g:c:d:') || die($usage."\n");
+my ($taxonID, $genome_name, $descr, $srcdb)=
+  ($Getopt::Std::opt_t, $Getopt::Std::opt_g,
+   $Getopt::Std::opt_c, $Getopt::Std::opt_d);
+die("$usage Error: -t and -g options are required!\n") 
+   unless $taxonID && $genome_name;
+
+my $ds=dbSession->new('geanno@NEOSYBASE');
+my ($genus, $species);
+if ($taxonID !~ m/^\d+$/) {
+ (my $t, $genus, $species)=$ds->getval("select taxon_id, genus, species from taxon where common_name='$taxonID'");
+ if ($t>0) {
+   $taxonID=$t;
+   }
+  else {
+   die("Error: cannot find taxon ID for organism '$taxonID'\n");
+   }
+ } #common name given, not numeric taxon ID
+else {
+($genus, $species)=$ds->getval(qq/select genus, species
+                         from taxon where taxon_id=$taxonID/);
+die("Error: cannot locate taxon# $taxonID in the database!\n".
+     "Please create the entry first.\n") unless $genus;
+}
+print STDERR "Loading genomic sequence for taxon $taxonID : '$genus $species'\n";
+
+my $chunksize=1024; # gseq.seq field length
+
+my $seqname;
+my $seqid=$ds->getval('select max(gseq_id) from ginfo');
+$seqid=0 unless $seqid>0; #the very first time 
+my $seqchunk; #max 1024 seqchunk to load;
+my $chunkid;  #starting at 0 for each sequence <=> gseq.seg_id
+
+while(<>) {
+ if (m/^>(\S+)/) { #defline
+   my $newseqname=$1;
+   if ($seqname) {
+     loadSeqChunk($seqchunk) if $seqchunk;
+     print STDERR "   .. loaded $chunkid sequence chunks.\n";
+     }
+   $seqname=$newseqname;
+   $seqid++;
+   $chunkid=0;
+   $seqchunk='';
+   $ds->do(qq/insert ginfo (gseq_id, taxon_id, release, name) 
+               values ($seqid, $taxonID, '$genome_name', '$seqname')/);
+   print STDERR "Loading sequence data for $seqname..\n";
+   next;
+   }
+ # sequence line
+ next unless $seqname;
+ tr/\r\n\t //d; 
+ $seqchunk.=$_;
+ if ((my $lendif=length($seqchunk)-$chunksize)>=0) { 
+      loadSeqChunk(substr($seqchunk,0,$chunksize)); #loads only the first $chunksize characters always!
+      $seqchunk = ($lendif>0) ? substr($seqchunk, $chunksize) : '';
+      }
+ }
+if ($seqname) { 
+ loadSeqChunk($seqchunk) if $seqchunk;
+ print STDERR "   .. loaded $chunkid sequence chunks.\n";
+ }
+
+$ds->logout();
+
+sub loadSeqChunk {
+ my $seqdata=shift(@_);
+ $ds->do("insert gseq values ($seqid, $chunkid, '$seqdata')");
+ $chunkid++;
+}

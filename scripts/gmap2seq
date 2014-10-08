@@ -1,0 +1,21 @@
+#!/bin/tcsh -f
+
+set prog = 'gmap'
+if ( $0 =~ *pmap2seq ) then
+  set prog = 'pmap'
+  endif
+
+if ($2'x' == 'x') then
+ echo "Usage: \n $0 qryseq(s).fasta genomicseq.fasta"
+ exit 1
+endif
+
+set fqry=$1
+shift
+set fgenomic=$1
+shift
+if (-f $fqry && -f $fgenomic) then
+ $prog -g $fgenomic -f2 $* $fqry
+ else
+echo "$fqry or $fgenomic not found!"
+endif

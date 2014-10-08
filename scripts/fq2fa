@@ -1,0 +1,51 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+my $usage = q/Usage:
+  fq2fa [-l <minlen>] < in.fastq > out.fasta
+/;
+umask 0002;
+getopts('l:o:') || die($usage."\n");
+my $outfile=$Getopt::Std::opt_o;
+if ($outfile) {
+  open(OUTF, '>'.$outfile) || die("Error creating output file $outfile\n");
+  select(OUTF);
+  }
+
+my $minlen=$Getopt::Std::opt_l;
+#print STDERR "minlen=".int($minlen)."\n";
+my $c=0;
+while (<>) {
+ if (m/^@(\S+)/) {
+   my $seqname=$1;
+   my $seq=<>;
+   $seq=~tr/\n\r//d;
+   my $qh;
+   while (<>) {
+     tr/\n\r//d;
+     last if m/^\+/;
+     $seq.=$_;
+     }
+   $qh=$_;
+   die("Error: Qualities header for $seqname not found!\n") 
+      unless $qh;
+   my $l=length($seq);
+   my $quals;
+   while (<>) {
+    tr/\n\r//d;
+    $quals.=$_;
+    last if (length($quals)>=$l);
+     #for colorspace reads it could be: length(quals)>=$l-1
+    }
+   $c++;
+   next if ($minlen && $l<$minlen);
+   print ">$seqname\n$seq\n";
+   }
+}
+
+if ($outfile) {
+ select(STDOUT);
+ close(OUTF);
+ }
+
+print STDERR "$c FASTA records written.\n"

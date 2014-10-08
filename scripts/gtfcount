@@ -1,0 +1,45 @@
+#!/bin/tcsh -f
+if ("x"$1 == "x-h") then
+echo "Usage: gtfcount [-g][-c][-l] <gtfile>"
+echo "  Show the count of distinct transcript names.\n  Options:"
+echo " -g : report distinct gene names count (gene_id attribute)"
+echo " -c : report transcript counts per reference sequence"
+echo " -C : show count of coding transcripts"
+echo " -l : list transcripts"
+echo " -Cl : list coding transcripts"
+echo " -f : report transcript counts per gene_id"
+exit 1
+endif
+if ("x"$1 == "x-g") then
+  shift
+  perl -ne 'print "$1\n" if m/gene_id "([^"]+)/' $1 | sort -u | wc -l 
+  exit
+  endif
+if ("x"$1 == "x-l") then
+  shift
+  perl -ne 'print "$1\n" if m/transcript_id "([^"]+)/' $1 | sort -u
+  exit
+  endif
+if ("x"$1 == "x-Cl") then
+  shift
+  perl -ne 'print "$1\n" if m/\tCDS\t/ && m/transcript_id "([^"]+)/' $1 | sort -u
+  exit
+  endif
+if ("x"$1 == "x-c") then
+  shift
+  perl -ne '@t=split(/\t/);print "$t[0]\t$1\n" if $t[8]=~m/transcript_id "([^"]+)/' $1 | sort -u | cut -f1 | uniq -c
+  exit
+  endif
+if ("x"$1 == "x-C") then
+  shift
+  perl -ne 'print "$1\n" if m/\tCDS\t/ && m/transcript_id "([^"]+)/' $1 | sort -u | wc -l
+  exit
+  endif
+
+if ("x"$1 == "x-f") then
+  shift
+  perl -ne '($g)=(m/gene_id\s+"([^"]+)/); ($t)=(m/transcript_id\s+"([^"]+)/); print "$g\t$t\n" if $g && $t' $1 | sort -u | cut -f1 | uniq -c
+  exit
+  endif
+
+perl -ne 'print "$1\n" if m/transcript_id "([^"]+)/' $1 | sort -u | wc -l

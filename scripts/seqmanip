@@ -1,0 +1,800 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+use Fcntl qw(SEEK_SET SEEK_END SEEK_CUR); # for seek
+
+my $usage=q/
+A simple fasta sequence(s) manipulation tool.
+Usage:
+ seqmanip [-C] [-r<ranges>] [-L] [-D|-X] [-I] [-G] [-T|-t <frame>|-Z] 
+    [-M|-m <ncount>] [-f <ranges_file>] [fasta file(s)...]
+ The input files should be one or more nucleotide or aminoacid sequences
+ in FASTA or raw format; if no files are given, input is expected at STDIN
+ 
+ Options:
+ -C reverse complement (is -r is given, first the subsequence is extracted
+    and only then reverse-complemented)
+ -l the line length for the output fasta record (default 70)
+ -r extract a range (subsequence) from the first input fasta sequence;
+    <range> can have one of the formats:
+    <start>..<end> or <start>-<end> or <start>:<len>
+    Multiple such intervals can be given after the -r option (comma or space
+    delimited) and they will be spliced together
+    This option doesn't work with -M or -n options.
+ -f same as -r but for multi-fasta\/seq input; expects a file containing
+    lines of this format:
+    <seqname> <range>
+    The format of <range> is the same with the -r above or it may be just 
+    space delimited <start> <end> numbers; the output will be a multi-fasta
+    file with one subsequence for each line in the <ranges_file>
+ -M merge (concatenate) all input sequences into a single sequence
+ -m merge all input sequences separating them by <ncount> Ns
+ -d provides a custom defline for -M and -m options
+ -D add basic, dummy defline if the input doesn't provide one, or add
+    sequence length to the existing defline
+ -X exclude defline from the output (just print the sequence)
+ -L provide one-line output for each sequence 
+ -T first frame translation (DNA to aminoacid)  
+ -t <frame>th frame translation; <frame> could be 1,2,3,-1,-2,-3
+ -E show exon\/splice-sites\/start\/stop info (requires -r)
+ -G show GFF output for the given range(s) (requires -r)
+ -Z raw reverse translate the output (aminoacid to DNA, rather useless)
+ -V only show a sequence if it's a valid, complete CDS 
+ -q only show a sequence if it's longer than or equal to <minseqlen>
+ -x only show a sequence if it's shorter than or equal to <maxseqlen>
+ -n discard sequences with a percentage of Ns (or Xs) higher than <maxpercN>
+ -y remove spans of Ns longer than <maxnspan> replacing them by <maxnspan> Ns
+ -Y trim Ns from either end of sequence
+ -U cleanup\/remove extraneous characters(e.g. digits, dashes, stars) 
+    from every input sequence
+ -R convert RNA to DNA (simply replacing U wih T)
+ -P convert all sequence letters to uppercase
+ -A use ANSI colors to highlight features in terminal (for -E option)
+ -O return longest ORF sequence for each input sequence (start..stop)
+ -Q same as -O but doesn't require a start codon
+/;
+
+my %codons=(
+'AAA'=>'K', 'AAC'=>'N', 'AAG'=>'K', 'AAR'=>'K', 'AAT'=>'N',
+'AAY'=>'N', 'ACA'=>'T', 'ACB'=>'T', 'ACC'=>'T', 'ACD'=>'T',
+'ACG'=>'T', 'ACH'=>'T', 'ACK'=>'T', 'ACM'=>'T', 'ACN'=>'T',
+'ACR'=>'T', 'ACS'=>'T', 'ACT'=>'T', 'ACV'=>'T', 'ACW'=>'T',
+'ACY'=>'T', 'AGA'=>'R', 'AGC'=>'S', 'AGG'=>'R', 'AGR'=>'R',
+'AGT'=>'S', 'AGY'=>'S', 'ATA'=>'I', 'ATC'=>'I', 'ATG'=>'M',
+'ATH'=>'I', 'ATM'=>'I', 'ATT'=>'I', 'ATW'=>'I', 'ATY'=>'I',
+'CAA'=>'Q', 'CAC'=>'H', 'CAG'=>'Q', 'CAR'=>'Q', 'CAT'=>'H',
+'CAY'=>'H', 'CCA'=>'P', 'CCB'=>'P', 'CCC'=>'P', 'CCD'=>'P',
+'CCG'=>'P', 'CCH'=>'P', 'CCK'=>'P', 'CCM'=>'P', 'CCN'=>'P',
+'CCR'=>'P', 'CCS'=>'P', 'CCT'=>'P', 'CCV'=>'P', 'CCW'=>'P',
+'CCY'=>'P', 'CGA'=>'R', 'CGB'=>'R', 'CGC'=>'R', 'CGD'=>'R',
+'CGG'=>'R', 'CGH'=>'R', 'CGK'=>'R', 'CGM'=>'R', 'CGN'=>'R',
+'CGR'=>'R', 'CGS'=>'R', 'CGT'=>'R', 'CGV'=>'R', 'CGW'=>'R',
+'CGY'=>'R', 'CTA'=>'L', 'CTB'=>'L', 'CTC'=>'L', 'CTD'=>'L',
+'CTG'=>'L', 'CTH'=>'L', 'CTK'=>'L', 'CTM'=>'L', 'CTN'=>'L',
+'CTR'=>'L', 'CTS'=>'L', 'CTT'=>'L', 'CTV'=>'L', 'CTW'=>'L',
+'CTY'=>'L', 'GAA'=>'E', 'GAC'=>'D', 'GAG'=>'E', 'GAR'=>'E',
+'GAT'=>'D', 'GAY'=>'D', 'GCA'=>'A', 'GCB'=>'A', 'GCC'=>'A',
+'GCD'=>'A', 'GCG'=>'A', 'GCH'=>'A', 'GCK'=>'A', 'GCM'=>'A',
+'GCN'=>'A', 'GCR'=>'A', 'GCS'=>'A', 'GCT'=>'A', 'GCV'=>'A',
+'GCW'=>'A', 'GCY'=>'A', 'GGA'=>'G', 'GGB'=>'G', 'GGC'=>'G',
+'GGD'=>'G', 'GGG'=>'G', 'GGH'=>'G', 'GGK'=>'G', 'GGM'=>'G',
+'GGN'=>'G', 'GGR'=>'G', 'GGS'=>'G', 'GGT'=>'G', 'GGV'=>'G',
+'GGW'=>'G', 'GGY'=>'G', 'GTA'=>'V', 'GTB'=>'V', 'GTC'=>'V',
+'GTD'=>'V', 'GTG'=>'V', 'GTH'=>'V', 'GTK'=>'V', 'GTM'=>'V',
+'GTN'=>'V', 'GTR'=>'V', 'GTS'=>'V', 'GTT'=>'V', 'GTV'=>'V',
+'GTW'=>'V', 'GTY'=>'V', 'MGA'=>'R', 'MGG'=>'R', 'MGR'=>'R',
+'NNN'=>'X', 'RAY'=>'B', 'SAR'=>'Z', 'TAA'=>'.', 'TAC'=>'Y',
+'TAG'=>'.', 'TAR'=>'.', 'TAT'=>'Y', 'TAY'=>'Y', 'TCA'=>'S',
+'TCB'=>'S', 'TCC'=>'S', 'TCD'=>'S', 'TCG'=>'S', 'TCH'=>'S',
+'TCK'=>'S', 'TCM'=>'S', 'TCN'=>'S', 'TCR'=>'S', 'TCS'=>'S',
+'TCT'=>'S', 'TCV'=>'S', 'TCW'=>'S', 'TCY'=>'S', 'TGA'=>'.',
+'TGC'=>'C', 'TGG'=>'W', 'TGT'=>'C', 'TGY'=>'C', 'TRA'=>'.',
+'TTA'=>'L', 'TTC'=>'F', 'TTG'=>'L', 'TTR'=>'L', 'TTT'=>'F',
+'TTY'=>'F', 'XXX'=>'X', 'YTA'=>'L', 'YTG'=>'L', 'YTR'=>'L'
+);
+
+
+getopts('AZTUPMEGNRXDVCLYOQr:d:m:q:x:l:t:f:y:n:') || die "$usage\n";
+#my %ranges; # seqname => [offset, len] only populated by -r or -f option;
+my @ranges; # list of [chr, strand, defline, [[offset1,len1], [offset1,len2], ..]]
+            #           0      1       2      3
+#my @range_chrs; # just to keep track of the order of ranges requested
+my $fai_loaded=0;
+my %fai_h; # seqID => [fpos, linelen, delimlen, seqlen]
+
+my $m_linerest; #for the merge case (-M)
+my $linelen=$Getopt::Std::opt_l || 70;
+my $user_defline=$Getopt::Std::opt_d || 'dummyname';
+my $ansicolors=$Getopt::Std::opt_A;
+#some ansi colors:
+my ($clred, $clgreen, $clreset)=("\e[1;33;41m", # bright yellow on red
+                "\e[0;32;40m", # green on black
+                "\e[0m") #reset colors
+               if $ansicolors;
+my %toDNA=reverse(%codons);
+@toDNA{'P','F','K','G'}=('CCC','TTT','AAA','GGG');
+my ($getOrf, $getOrfAny)=($Getopt::Std::opt_O, $Getopt::Std::opt_Q);
+$getOrf=1 if $getOrfAny;
+my $complement=$Getopt::Std::opt_C;
+my $validateCDS=$Getopt::Std::opt_V;
+my $exoninfo=$Getopt::Std::opt_E;
+my $gffout=$Getopt::Std::opt_G;
+my $rna2dna=$Getopt::Std::opt_R;
+my $mergedist=$Getopt::Std::opt_m;
+my $minseqlen=$Getopt::Std::opt_q;
+my $maxseqlen=$Getopt::Std::opt_x;
+my $maxnspan=$Getopt::Std::opt_y;
+my $trimNs=$Getopt::Std::opt_Y;
+my $maxnrepl='';
+if ($maxnspan) {
+  $maxnrepl='N' x $maxnspan;
+  $maxnspan++;
+  }
+my $maxpercn=$Getopt::Std::opt_n;
+my $mergesep;
+if ($mergedist>0) {
+   $Getopt::Std::opt_M=1;
+   $mergesep='N' x $mergedist;
+   }
+my $rangetarget; #if a specific seq target was provided
+# if this is not set, then the first fasta sequence given as input
+# will be used for range queries
+# parse range information if available
+if ($Getopt::Std::opt_r) {
+   my $rangetext=$Getopt::Std::opt_r;
+   #first attempt to split by :
+   
+   my $rstrand='+';
+   #if ($rangetext=~s/([\-\+])$//) { $rstrand=$2;}
+   if ($rangetext=~s/(\d+[\.\-\:_]+\d+)([\-\+])$/$1/) { $rstrand=$2; }
+   my @ar=split(/[\,\s]+/,$rangetext); #allow multiple ranges
+   my $seqtarget;
+   unless ($ar[0]=~m/^\d+\:\d+$/) {
+      my @c=split(/\:/, $ar[0]);
+      if (@c>1) {
+        $ar[0]=pop(@c);
+        $rangetarget=1;
+        $seqtarget=join(':',@c);
+        if ($seqtarget=~s/([\-\+])$//) { $rstrand=$1;}
+      }
+      #if ($ar[0]=~s/^([\w\|\:\-\+\.]+)\://) {
+      #  # target chromosome given
+      #  $seqtarget=$1;
+      #  if ($seqtarget=~s/([\-\+])$//) { $rstrand=$1;}
+      #  $rangetarget=1;
+      #  }
+   }
+   if ($seqtarget) { #   0        1     2    3
+     push(@ranges, [$seqtarget,$rstrand,'', []]);
+   }
+    else {
+     push(@ranges, ['-',$rstrand,'',[]]);
+   }
+   my $rdata=$ranges[0]->[3]; # [ ]
+   foreach my $rt (@ar) {
+     my ($rStart, $rLen)=&parseRange($rt);
+     push(@$rdata, [$rStart, $rLen]);
+     }
+   }
+ elsif ($Getopt::Std::opt_f) { # file with ranges to pull
+     my $frname=$Getopt::Std::opt_f;
+     my $using_stdin;
+     if ($frname eq '-' || $frname eq 'stdin') {
+       #open(FRNG, <&STDIN);
+       open(FRNG,  "<&=STDIN")  or die "Couldn't alias STDIN : $!";
+       $using_stdin=1;
+       }
+     else {
+       open (FRNG, $frname) || die ("Error: cannot open seq ranges file '$frname'!\n");
+       }
+     while (<FRNG>) {
+       chomp;
+       my $rstrand='+';
+       my ($seqname, $rangetxt)=split(/\s+/,$_,2);
+       my $defline;
+       if ($seqname=~m/^([\w\|\-\+\.]+)\:(\d+[\.\-_]+\d*[\-\+]?)/) {
+          #chr:start-end format
+          # strand may follow chr or end
+          $seqname=$1;
+          $defline=$rangetxt;
+          $rangetxt=$2;
+          if ($seqname=~s/([\-\+])$//) { $rstrand=$1;}
+           elsif ($rangetxt=~s/(\d+[\.\-_]+\d+)([\-\+])$/$1/) { $rstrand=$2; }
+          }
+         else { #1st column is chr(strand), 2nd column is the interval
+          if ($seqname=~s/([\-\+])$//) { $rstrand=$1; }
+          $rangetxt=~s/(\d+)[\t ]+(\d+)/$1-$2/g;
+          my @rt=split(/\s+/,$rangetxt,2);
+          if ($rt[1]) {
+            $defline=$rt[1];
+            $rangetxt=$rt[0];
+            }
+          }
+       next unless $rangetxt;
+       push(@ranges, [$seqname, $rstrand, $defline, []]);
+       my $rdata=$ranges[-1]->[3];
+       #$rangetxt=~s/(\d+)[\t ]+(\d+)/$1-$2/g; #could be space delimited
+       my @ar=split(/\,/,$rangetxt);
+       foreach my $rt (@ar) {
+         my ($rStart, $rLen)=&parseRange($rt);
+         push(@$rdata, [$rStart, $rLen]);
+         }
+       }
+     $rangetarget=1 if @ranges>0;
+     close(FRNG) unless $using_stdin;
+     }
+ my $seq;
+ my $seq_len;
+ my $count=0;
+ my $defline;
+ my $curseq;
+ my $seqcount;
+ print ">$user_defline\n" if ($Getopt::Std::opt_M && !$Getopt::Std::opt_X);
+ die("Error: target sequence(s) given but no input file!\n") 
+      if ($rangetarget && (@ARGV==0 || ! -f $ARGV[0]));
+ my $qrange=(@ranges>0 && @ARGV>0 && -f $ARGV[0]);
+ if ($qrange) { #target 
+   if (@ranges==1 && $ranges[0]->[0] eq '-') { #single fasta file
+       processRanges($ARGV[0], $ranges[0]);
+       } # single-fasta file
+    else {
+       #actual sequence names provided, need cdbfasta or samtools index
+       my $fasta=$ARGV[0];
+       #die("Error: no fasta file $fasta!\n") unless -f $fasta;
+       my $faidx;
+       if ($fasta=~s/\.fai$//) {
+         $faidx=$fasta.'.fai';
+         }
+        else {
+         $faidx=$fasta.'.fai' if -f $fasta.'.fai';
+         }
+       unless ($faidx) {
+         if ($fasta=~s/\.cidx$//) {
+             $faidx=$fasta.'.cidx';
+             }
+           else {
+             $faidx=$fasta.'.cidx' if -f $fasta.'.cidx';
+             }
+          }
+       #print STDERR "info: using fasta index $faidx for $fasta.\n";
+       die("Error: no index file for fasta file $fasta") unless $faidx;
+       die("Error: no fasta file $fasta!\n") unless -f $fasta;
+       foreach my $rd (@ranges) {
+           processRanges($fasta, $rd, $faidx);
+           }
+       } # cidx file needed
+   } # fast[er] range queries
+ else { # normal (serial) stream processing, very slow range processing for large sequences
+   while (<>) {
+      if (m/^(>.+)/) {
+       process_seq() if $curseq; #sequence is in $seq variable
+       $defline=$1;
+       ($curseq)=($defline=~m/^>(\S+)/);
+       $seq_len=0;
+       next;
+       }
+      chomp; 
+      tr/ \t\r\n//d;
+      $seq.=$_;
+      $seq_len+=length();
+      process_seq() unless $curseq; #no defline = raw input: one sequence per line
+      }
+   process_seq() if $curseq; #sequence is in $seq variable
+ }
+
+ print "$m_linerest\n" if ($Getopt::Std::opt_M && $m_linerest);
+
+#============================ 
+
+sub fai_load {
+ open(FAI, $_[0]) || die ("Error opening index file $_[0]!\n");
+ while (<FAI>) {
+  my @t=split(/\t/);# 0=seqID  1=seqlen 2=fpos 3=linelen 4=linelen+dlen
+  next if m/^#/ && @t<5;
+  $fai_h{$t[0]}=[$t[2], $t[3], $t[4]-$t[3], $t[1]];
+  # seqID => [fpos, linelen, delimlen, seqlen]
+  }
+ close(FAI);
+ $fai_loaded=1;
+ }
+
+sub processRanges {
+ #my ($fasta, $chr, $chr_rdata, $faidx, $udefline)=@_;
+ my ($fasta, $r_data, $faidx)=@_;
+ my $chr=$$r_data[0];
+ $chr='' if $chr eq '-';
+ my $chr_strand=$$r_data[1];
+ my $udefline=$$r_data[2];
+ my $chr_rdata=$$r_data[3];
+ my @intvs = sort { $main::a->[0] <=> $main::b->[0] } @$chr_rdata; #range intervals
+ my ($fpos, $seqlen, $dlen, $flinelen); 
+ open(FA, $fasta) || die("Error opening fasta file $fasta\n");
+ $fpos=0;
+ my $iscdb=($faidx=~m/\.cidx$/);
+ if ($chr) {
+   die("Error: target sequence given, but no fasta index\n") unless $faidx;
+   if ($iscdb) {
+     my $r=`cdbyank -a '$chr' -P $faidx`;
+     my $syserr=$?;
+     chomp($r);
+     die("Error at cdbyank -a '$chr' -P $faidx (exit code $syserr)\n") if length($r)==0 || $syserr;
+     $fpos=int($r);
+     seek(FA, $fpos, SEEK_SET);
+     }
+   else { #fasta index
+     #only load the first time 
+     fai_load($faidx) unless ($fai_loaded);
+     my $cd=$fai_h{$chr};
+     die("Error retrieving $chr data from fasta index!\n") unless $cd;
+     ($fpos, $flinelen, $dlen, $seqlen)=@$cd;
+     $intvs[-1]->[1]=$seqlen-$intvs[-1]->[0]+1 unless $intvs[-1]->[1];
+     if ($intvs[-1]->[1]<=0) {
+        #invalid range
+        $seq='';
+        $defline='';
+        return;
+        }
+     $defline = $udefline ? '>'.$udefline : ">$chr";
+     seek(FA, $fpos, SEEK_SET);
+     } #samtools fai
+   } #indexed access
+ if ($iscdb || !$chr) { 
+      #for cdb or plain fasta we have to determine line length by reading the first 1k bytes
+     my $rbuf;
+     read(FA, $rbuf, 1024);
+     my @lines=split(/[\n\r]+/,$rbuf);
+     my @ldelim=($rbuf=~m/([\n\r]+)/gs);
+     if (@ldelim<2) { #we need at least 2 full lines read
+        my $radd;
+        read(FA, $radd, 4096);
+        $rbuf.=$radd;
+        @lines=split(/[\n\r]+/,$rbuf);
+        @ldelim=($rbuf=~m/([\n\r]+)/gs);
+        }
+     $dlen=length($ldelim[0]);
+     die("Error determining line ending type for $fasta!\n") if ($dlen==0);
+     $defline = $udefline ? ">$udefline" : $lines[0];
+     $flinelen=length($lines[1]); #line length in fasta record
+     $fpos+=length($lines[0])+$dlen;
+     seek(FA, $fpos, SEEK_SET); #reposition at the beginning of the sequence
+     }
+ #now we are positioned at the beginning of the fasta record sequence
+ #seek(FA, $fpos+length($lines[0])+$dlen, SEEK_SET);
+ $seq='';
+ my $revC=1 if $chr_strand eq '-';
+ my $rstart=$intvs[0]->[0]-1; #first range start position, 0-based
+ my $rstartpos= ($rstart<$flinelen) ? $rstart : ($rstart+$dlen*(int($rstart/$flinelen)));
+ my $fstartpos=$fpos+$rstartpos;
+ seek(FA, $fstartpos, SEEK_SET);
+ if ($intvs[-1]->[1]) { #ending for last interval is known
+   my $rend=$intvs[-1]->[0]+$intvs[-1]->[1]-2;
+   #$seq_len=$rend-$rstart+1;
+   my $rendpos=($rend<$flinelen) ? $rend : ($rend+$dlen*(int($rend/$flinelen)));
+   #print STDERR "pulling from $fstartpos to $rendpos\n";
+   my $readlen=$rendpos-$rstartpos+1;
+   #my $fstartpos=$fpos+length($lines[0])+$dlen+$rstartpos;
+   read(FA, $seq, $readlen) || die("Error reading $readlen bytes from fasta $fasta at offset $fstartpos\n");
+   close(FA);
+   }
+  else { #last interval goes to the end of sequence, but seqlen is not known
+   my $rend=$intvs[-1]->[0]+$intvs[-1]->[1]-2;
+   #$seq_len=$rend-$rstart+1;
+   local $_;
+   while (<FA> && !m/^>/) {
+     $seq.=$_;
+     }
+   close(FA);
+   }
+ $seq=~tr/\n\r//d;
+ $seq_len=length($seq);
+ #now extract the ranges:
+ my @rdata;
+ my $txt_intvs;
+ foreach my $r (@intvs) {
+    push(@rdata, [$$r[0]-$rstart, $$r[1]]);
+    #$spliceseq.=substr($subseq, $cstart, $clen);
+    $txt_intvs.='|'.$$r[0].'-'.($$r[0]+$$r[1]-1);
+    }
+ $defline.=$txt_intvs.$chr_strand unless $udefline;
+ process_seq(\@rdata, $rstart, $revC);
+}
+
+sub process_seq {
+ #my $range = $rangekey ? $ranges{$rangekey} : $ranges{$_[0]};
+ return unless $seq;
+ my ($range, $basepos, $revC)=@_; 
+ if ($maxnspan) {
+   $seq=~s/[NX]{$maxnspan,}/$maxnrepl/ig;
+   $seq_len=length($seq);  
+   }
+ if ($Getopt::Std::opt_U) {
+  $seq=~tr/A-Za-z//cd;
+  $seq_len=length($seq);
+  }
+ if ($rna2dna) {
+  $seq =~ tr/Uu/Tt/;
+  } 
+ $seq=uc($seq) if $Getopt::Std::opt_P;
+ if ($trimNs) {
+   $seq=~s/^[NX]+//;
+   $seq=~s/[NX]+$//;
+   $seq_len=length($seq);
+   }
+ if ($minseqlen && $seq_len<$minseqlen) {
+   $seq='';
+   $seq_len=0;
+   return;
+   }
+ if ($maxseqlen && $seq_len>$maxseqlen) {
+   $seq='';
+   $seq_len=0;
+   return;
+   }
+ if ($maxpercn) {
+   my $nN=($seq=~tr/AaCcGgTtUu//c);
+   if ((($nN*100.0)/$seq_len)>$maxpercn) {
+      $seq='';
+      $seq_len=0;
+      return;
+      }
+   }
+ # basepos is a 0 based offset
+ unless ($range || @ranges==0) {
+    $range=$ranges[0]->[3];
+    #print STDERR "using default, first ranges!\n"; #DEBUG
+    } 
+ #print STDERR "key=$_[0], range=$$range[0] ($$range[1])\n";
+ #print STDERR "$range\t$seq\n";
+ 
+ $seqcount++;
+ if ($Getopt::Std::opt_M) { #merge only;
+   #merge all input
+   if ($mergedist>0 && $seqcount>1) {
+      $seq=$m_linerest.$mergesep.$seq;
+      }
+    else {
+      $seq=$m_linerest.$seq;
+      }
+   $m_linerest='';
+   $seq_len=length($seq);
+   for (my $p=0;$p<$seq_len;$p+=$linelen) {
+      my $sline=substr($seq, $p, $linelen);
+      if (length($sline)==$linelen) {
+           print $sline."\n";
+           }
+         else {
+           $m_linerest=$sline;
+           last;
+           }
+      }
+   $seq='';
+   $seq_len=0;
+   return;
+   }
+ my @seqranges;
+ my $intr_ends='';    #        0        1         2         3
+ my @gfdata; #array of  [exon_start, exon_len, cdsphase, diagram]
+ if ($range) {  #extract range
+   my @intvs = sort { $main::a->[0] <=> $main::b->[0] } @$range;
+   #print STDERR length($seq)." (seq_len=$seq_len)\n";
+   #print STDERR "beginning: ".substr($seq,0,10)."\n";
+   #print STDERR "   ending: ".substr($seq,-10)."\n";
+   my $i=0;
+   foreach my $rng (@intvs) {
+     $i++;
+     if ($$rng[1]>0) {
+        push(@seqranges, substr($seq, $$rng[0]-1, $$rng[1]));
+        my $ss_before=substr($seq, $$rng[0]-3,2);
+        $ss_before='NN' unless length($ss_before)==2;
+        my $ss_after=substr($seq, $$rng[0]+$$rng[1]-1,2);
+        $ss_after='NN' unless length($ss_after)==2;
+        $intr_ends.=$ss_before.$ss_after;
+        push(@gfdata, [$$rng[0], $$rng[1], 0,'']);
+        #print STDERR ">>$seq<<\n";
+        }
+       #elsif ($$rng[1]<0) { # DON"T use this or mix ranges it's not consistent!
+       #  my $rseq=substr($seq, $$rng[0]-1, -$$rng[1]);
+       #  push(@seqranges, reverseComplement($rseq));
+       #  push(@gfdata, [$$rng[0], $$rng[1], 0, '']);
+       #  }
+       else { #0 length means to the end of sequence 
+          push(@seqranges, substr($seq, $$rng[0]-1));
+          push(@gfdata, [$$rng[0], length($seqranges[-1]), 0,'']);
+          }
+      }#for each range
+   #print STDERR "intr_ends=$intr_ends\n";
+   }
+  else { #no ranges requested, create a dummy one with the whole sequence
+    push(@seqranges, $seq); 
+    push(@gfdata, [1, length($seqranges[-1]),0, '']);
+    }
+ # -- first and last codons
+ #there is that rare case when the start/stop codons can be
+ #broken/split by an intron
+ my ($fcodon, $lcodon);
+ my $num_exons=scalar(@seqranges);
+ if ($num_exons>1) {
+    my $l=$#seqranges;
+    ($fcodon, $lcodon)=( uc(substr($seqranges[0].$seqranges[1],0,3)), 
+                         uc(substr($seqranges[$l-1].$seqranges[$l],-3)) );
+    }
+   else { # single-exon 
+    ($fcodon, $lcodon)=( uc(substr($seqranges[0],0,3)), 
+                         uc(substr($seqranges[-1],-3)) );
+    }
+ my $trframe=$Getopt::Std::opt_t || $Getopt::Std::opt_T;
+ my $splseq;
+ $revC=($revC || $complement);
+ foreach my $sq (@seqranges) {
+    # -- complement requested?
+    if ($revC) {
+      $sq=reverseComplement($sq);
+      #complement the range coordinates too!
+      #$rStart=length($seq)-($rStart+$rLen)+2 if $range;
+      $splseq=$sq.$splseq;
+      }
+     else {
+      $splseq.=$sq; 
+      }
+    } # for each range
+   
+  if (length($intr_ends)>4) { # have introns
+    $intr_ends=substr($intr_ends,2,-2);
+    if ($revC) {
+       $intr_ends=reverseComplement($intr_ends);
+       }
+    }
+    
+   if ($revC) {
+    @gfdata=reverse(@gfdata);
+    ($fcodon, $lcodon)=(reverseComplement($lcodon), 
+                              reverseComplement($fcodon));
+    }
+   # determine CDS phases
+   my $initphase=0; #could be provided
+   my $acclen=3-$initphase;
+   foreach my $x (@gfdata) {
+         #$$x[2]=($initframe+$acclen) % 3;
+         $$x[2]=(3-$acclen%3) % 3;
+         $acclen+=$$x[1];
+         }
+    my $printflag=1; #should it be printed or not?
+   # $splseq has the actual sequence to be processed
+   # ========== vvvv - any other seq processing/trimming should be applied here:
+   if ($getOrf) {
+      my ($orf_start, $orf_end);
+      ($splseq, $orf_start, $orf_end)=getLongestOrf($splseq);
+      if ($orf_start<=0) {
+            $defline.=' ORF:none';
+            $orf_start=0;$orf_end=0;
+            $splseq='';
+            $printflag=0;
+            }
+         else {
+           $defline.=" ORF:$orf_start-$orf_end" if $defline;
+           }
+      }
+   my $transl; 
+   if ($trframe) {
+    $transl=&dna2prot($splseq, $trframe);  #<trframe>th frame translate request
+    $splseq=$transl;
+    }
+    elsif ($Getopt::Std::opt_Z) {
+     $splseq=&prot2dna($splseq);  #back-translate request
+    }
+   # ========== ^^^^
+   #------ output processing here:
+  if ($validateCDS) {
+     $transl=&dna2prot($splseq, $trframe) unless $transl;
+     $printflag= ($splseq%3 == 0 && $codons{$fcodon} eq 'M' 
+             && index($transl, '.')==length($transl)-1)
+     }
+  unless ($printflag) {
+     $seq=''; # signal that it was processed
+     $seq_len=0;
+     return;
+     }
+  unless ($gffout) {
+   if ($defline) { #format back to fasta
+     if ($Getopt::Std::opt_U) {
+       #clean up the defline as well
+       $defline=~s/^\s+//;
+       $defline=~s/\s+$//;
+       $defline=~tr/ \t/ \t/s;
+     }
+     my $addLen='';
+     $addLen=" $seq_len" if ($Getopt::Std::opt_D);
+     print $defline.$addLen."\n" unless ($Getopt::Std::opt_X);
+     }
+    else { #no defline found in the original file
+     if ($Getopt::Std::opt_D && !$Getopt::Std::opt_X) {
+       #my $defl='>SEQ'.$seqcount.'_'.length($seq);
+       my $defl='>SEQ'.$seqcount.'_'.$seq_len;
+       print "$defl\n";
+       }
+     }
+    } #print defline here
+  unless ($gffout) {
+    if ($Getopt::Std::opt_L) { #one line printing
+          print $splseq."\n";
+          }
+        else { # fasta multi-line printing
+         for (my $p=0;$p<length($splseq);$p+=$linelen) {
+           my $pl=substr($splseq, $p, $linelen)."\n";
+           print( ($trframe && $ansicolors) ? &colorize($pl, '.') : $pl );
+           }
+         }
+  }
+  my @wmsg;
+  if ($exoninfo || $gffout) {
+    $transl=&dna2prot($splseq, $trframe) unless $transl;
+    push(@wmsg,'NoStartCodon') if $codons{$fcodon} ne 'M';
+    #$wmsg.=';NoStopCodon' if $codons{$lcodon} ne '.';
+    push(@wmsg,'NoStopCodon') if substr($transl,-1) ne '.';
+    }
+  
+  if ($exoninfo) { #show exon info:
+    print STDERR    '----> Exon/CDS info ('.$num_exons." exons):\n";
+    my $afcodon=$fcodon;
+    $afcodon=$clgreen.$fcodon.$clreset if ($fcodon eq 'ATG');
+    my @gfd;;
+    my $pstrand=' ';
+    if ($revC) {
+      @gfd=map { $_->[0]+$_->[1]-1 } (@gfdata);
+      $pstrand='-';
+      }
+     else { @gfd=map { $_->[0] } @gfdata; }
+    printf STDERR '%8d%s     [%s~~', $basepos+$gfd[0],$pstrand,$afcodon;
+    #print STDERR  '  '.($basepos+int($gfdata[0]->[2])).'       ['.$fcodon.'~~';
+    if (@gfdata>1) { # multi-exon
+     my @splsites=unpack('(A4)*',$intr_ends);
+     my $xn=1;
+     foreach my $pair (@splsites) {
+       my $don=uc(substr($pair,0,2));
+       $don=$clred.$don.$clreset if ($ansicolors && $don ne 'GT');
+       my $acc=uc(substr($pair,-2));
+       $acc=$clred.$acc.$clreset if ($ansicolors && $acc ne 'AG');
+       print STDERR '~~~]'.$don."\n";
+       #print STDERR '  '.($basepos+int($gfdata[$xn]->[2])).'     '.
+       #              $acc. '[~~~~~';
+       printf STDERR '%8d%s   %s[~~~~~', $basepos+$gfd[$xn], $pstrand,$acc;
+       $xn++;
+       }
+     } #multi-exon
+    my $alcodon=$lcodon;
+    $alcodon=$clgreen.$lcodon.$clreset if $codons{uc($lcodon)} eq '.';
+    print STDERR $lcodon."]\n----------------------------";
+    if (@wmsg>0) {
+       print STDERR "Warning: ".$clred.join($clreset.', '.$clred,@wmsg).$clreset;
+       }
+    print STDERR "\n";
+    }
+  if ($gffout) {
+      #show GFF output
+      my $strand='+';
+      if ($revC) {
+         @gfdata=reverse(@gfdata); #restore in fact, because we reversed it earlier
+         $strand='-';
+         }
+      my ($seqid)=($defline=~m/^>(\S+)/);
+      my $warns='';
+      $warns=';'.join(';',@wmsg) if (@wmsg>0);
+      print join("\t", $seqid, 'jigsaw', 'mRNA', $basepos+$gfdata[0]->[0], 
+          $basepos+$gfdata[-1]->[0]+$gfdata[-1]->[1]-1,'.',$strand,'.', 'ID=tjsm.XX;Name=tjsm.XX'.$warns)."\n";
+      foreach my $gfl (@gfdata) { 
+        print join("\t", $seqid, 'jigsaw', 'CDS', $basepos+$$gfl[0], 
+          $basepos+$$gfl[0]+$$gfl[1]-1,'.',$strand,$$gfl[2], 'Parent=tjsm.XX')."\n";
+        }
+      }
+  $seq=''; #processed!
+  $seq_len=0;
+}
+
+
+sub parseRange {
+ my $r=$_[0];
+ my ($rStart, $sep, $rLen)= ($r =~ m/^(\d+)([ \t\.\-\:_]+)(\d*)/);
+ if ($rLen) {
+    if ($sep ne ':') { # start-to-end format
+      ($rLen, $rStart) = ($rLen<$rStart) ? ($rStart-$rLen+1, $rLen) : ($rLen-$rStart+1, $rStart);
+      }
+    }
+ #$rLen=-$rLen if ($rLen<0 && $r=~m/\d+\s*\-\s*$/);
+ $rLen=-$rLen if ($rLen<0);
+ return ($rStart, $rLen); #$rLen could be empty
+ }
+
+
+sub colorize {
+ #colorize all $p strings in $s
+ my ($s, $p)=@_;
+#$red="\e[1;33;41m";
+#$normal="\e[0m";
+ my $r="\e[1;33;41m"; # bright yellow on red
+ my $b="\e[0m"; #reset colors
+ $p=~s/\./\\./g;
+ $s=~s/($p)/$r$1$b/g;
+ return $s;
+}
+
+sub reverseComplement {
+  my $s=reverse($_[0]);
+  $s =~ tr/AaCcTtGgUuMmRrWwSsYyKkVvHhDdBb/TtGgAaCcAaKkYyWwSsRrMmBbDdHhVv/;
+  return $s;
+ }
+ 
+sub dna2prot {
+ my $frame=$_[1] || 1;
+ my $s;
+ if ($frame<0) {
+   $s=reverseComplement($_[0]);
+   $frame=-$frame;
+   }
+  else { $s=$_[0]; }
+ if ($frame==1) { $s= uc($s); }
+   else { $s = uc(substr($s, $frame-1)); } 
+ #my @cods = ($s =~ m/([A-Z][A-Z][A-Z])/g);
+ my @cods = unpack('(A3)*', $s);
+ my $r;
+ foreach my $c (@cods) {
+  my $aa=$codons{$c} || 'X';
+  $r.=$aa;
+  }
+ return $r; 
+}
+
+sub prot2dna {
+ my $s= uc($_[0]);
+ my @aa = ($s =~ m/([A-Z])/g);
+ my $r;
+ foreach my $a (@aa) {
+  my $codon=$toDNA{$a} || 'N';
+  $r.=$codon;
+  }
+ return $r; 
+}
+
+sub getLongestOrf {
+ my ($seq)=@_;
+ my $best=0;
+ my ($bests,$beste)=(-1,-1);
+ #my $bestorf="";
+ my $seqlen=length($seq);
+ my @starts=();
+ my @ends=();
+ if ($getOrfAny) { # include start frames if not a stop codon directly
+   for (my $frame=0;$frame<3;$frame++) {
+     unless ($seq=~m/^.{$frame}(taa|tga|tag)/i) {
+       push @starts,$frame+1;
+       }
+     }
+   }
+  while ($seq=~m/(atg)/gi) {
+   push @starts,pos($seq)-2;
+   }
+
+  while ($seq=~m/(taa|tga|tag)/gi) {
+    push @ends,pos($seq)-2;
+    }
+  push @ends,($seqlen-2,$seqlen-1,$seqlen);
+  for my $s (@starts) {
+    for my $e (@ends) {
+        if ($e%3==$s%3 and $e>$s) {
+           if ($e-$s>$best) {
+               $best=$e-$s;
+               ($bests,$beste)=($s,$e);
+               #$bestorf=substr($seq,$s-1,$e-$s+1);
+               }
+           last
+           }
+        else {
+           next
+           }
+        } #for each end
+    } #for each start
+  if ($bests<=0) {
+     return ('',0,0);
+     }
+  $beste+=2 if $beste<=length($seq)-2; #make it so it includes the stop codon!
+  return (substr($seq,$bests-1,$beste-$bests+1), $bests, $beste);
+}

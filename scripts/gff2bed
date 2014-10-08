@@ -1,0 +1,190 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+use FindBin;use lib $FindBin::Bin;
+
+my $usage = q/Usage:
+ gff2bed [-c:<rgb_color>] <input.gtf>
+ Convert GFF annotation to BED12 format
+/;
+umask 0002;
+getopts('c:o:') || die($usage."\n");
+my $outfile=$Getopt::Std::opt_o;
+if ($outfile) {
+  open(OUTF, '>'.$outfile) || die("Error creating output file $outfile\n");
+  select(OUTF);
+  }
+my $tcolor= $Getopt::Std::opt_c || 0;
+my $tmaxscore = 0;
+#$tcolor=hex($tcolor) if ($tcolor=~m/^0x/ || $tcolor=~m/[a-f,A-F]/);
+# ---------------------  0     1         2         3       4      5       6       7        8   
+my %recs; # recID =>  [ chr, strand, feat_type,  gname, tdescr, fstart, fend, [@exons], [@cds] ]
+             #
+my ($gname, $tdescr);
+while (<>) {
+   next if m/^\s*#/;
+   chomp;
+   my ($chr, $track, $f, $fstart, $fend, $fscore, $strand, $frame, $lnum)=split(/\t/);
+   next unless $fstart>1 && $lnum;
+   next if $f eq 'gene' || $f eq 'locus'; # Warning: skipping any 'gene' or 'locus' features, unconditionally
+   my $gff3_ID;
+   my $gff3_Parent;
+   my $score;
+   ($fstart, $fend)=($fend, $fstart) if $fend<$fstart;
+   ($score)=($lnum=~m/\bcov[= ]\"?([\d\.]+)/i); #or we can use fpkm of transcripts
+   if ($score>$tmaxscore) {
+      $tmaxscore=$score;
+      }
+   ($gff3_ID)=($lnum=~m/\bID=([^;]+)/);
+   ($gff3_Parent)=($lnum=~m/\bParent=([^;]+)/);
+   if ($gff3_ID || $gff3_Parent) { # GFF format
+      $gff3_ID=~tr/"//d; #"
+      $gff3_Parent=~tr/"//d; #"
+      $gff3_Parent='' if ($f eq 'mRNA');
+      if ($gff3_ID && !$gff3_Parent) { #top level feature
+         if ($f=~m/RNA/i || $f=~/gene/) {
+           # try to parse the description, if any
+           ($gname,$tdescr)=();
+           if ($lnum=~m/\b(?:descr|tophit|info|product)\s*=\s*"?([^;"]+)/i) {
+             $tdescr=$1;
+             }
+            elsif ($lnum=~m/Name\s*=\s*"?([^;"]+)/) {
+             $tdescr=$1;
+             }
+           if ($lnum=~m/\bgene_name[\s=]+"?([^;"]+)/i) {
+             $gname=$1;
+             }
+            elsif ($lnum=~m/Name\s*=\s*"?([^;"]+)/) {
+             $gname=$1;
+             }
+           $tdescr='' if ($tdescr eq $gname);
+           $gname='' if $gname eq $gff3_ID;
+           }
+         die("Error: duplicate feature $gff3_ID on $chr\n") if (exists($recs{"$chr|$gff3_ID"}));
+         my $recID="$chr|$gff3_ID";
+         $recs{$recID} = [$chr, $strand, $f, $gname, $tdescr, $fstart, $fend, [], [], $score ];
+         next;
+         } # parent/top-level feature
+      } #GFF
+     else { #GTF format
+      next if ($f eq 'transcript'); #exception: GTF with parent 'transcript' feature
+      }
+   # -------------- exon/CDS line here:
+   my $recID;
+   ($gname, $tdescr)=();
+   if ($track=~/^jigsaw/ && $lnum=~m/^\d+$/) {
+     $recID=$chr.'.jsm.'.$lnum;
+     }
+    elsif ($lnum=~m/Parent=(['"\:\w\|\-\.]+)/) {
+     $recID=$1;
+     $recID=~tr/"//d; #"
+     }
+    elsif ($lnum=~m/transcript_id[= ]+(['"\:\w\.\|\-]+)/) {
+     $recID=$1;
+     $recID=~tr/"//d; #"
+     }
+    else {
+     die("Error: cannot parse locus/transcript name from input line:\n$_\n");
+     }
+   if (!$gname && $lnum=~m/gene_id[= ]+(['"\:\w\.\|\-]+)/) {
+      $gname=$1;
+      $gname=~tr/"//d; #"
+      }
+   $tdescr='' if index($recID, $tdescr)>=0;
+   $gname='' if index($recID, $gname)>=0;
+   $recID=$chr.'|'.$recID;
+   my $ld = $recs{$recID};
+   if ($ld) { #existing entry
+     my $i=($f eq 'CDS') ? 8 : 7;
+     my ($lstart, $lend)=($$ld[5], $$ld[6]);
+     $$ld[5]=$fstart if $fstart<$lstart;
+     $$ld[6]=$fend if $fend>$lend;
+     push(@{$$ld[$i]}, [$fstart, $fend, $fscore]);
+     }
+    else { # first time seeing this transcript
+     $recs{$recID} = ($f eq 'CDS') ? 
+           [$chr, $strand, $f, $gname, $tdescr, $fstart, $fend, [], [[$fstart, $fend, $fscore]], $score ] :
+           [$chr, $strand, $f, $gname, $tdescr, $fstart, $fend, [[$fstart, $fend, $fscore]], [], $score ] ;
+            # 0       1     2     3       4        5       6     7 (exons)                8 (CDS)
+     ($gname,$tdescr)=();
+     } 
+} #while <>
+
+
+# -- sort features by chromosome:
+print STDERR "GFF data loaded. Sorting by chromosome location..\n";
+my @sorted_features=sort sortByLoc keys(%recs);
+print STDERR "Writing BED file..\n";
+writeModels(\@sorted_features);
+print STDERR "Done.\n";
+# --
+if ($outfile) {
+ select(STDOUT);
+ close(OUTF);
+ }
+
+#************ Subroutines **************
+sub sortByLoc {
+ my $da=$recs{$a};
+ my $db=$recs{$b};
+ if ($$da[0] eq $$db[0]) {
+    return ($$da[5]==$$db[5]) ? $$da[6] <=> $$db[6] : $$da[5] <=> $$db[5] ;
+    }
+  else { return $$da[0] cmp $$db[0] ; }
+}
+
+sub writeModels {
+ #return if keys(%recs)==0;
+ my $rlist=shift(@_);
+ my @recs_keys;
+ unless ($rlist) {
+    @recs_keys=keys(%recs);
+    $rlist=\@recs_keys;
+    }
+ 
+ foreach my $gffid (@$rlist) {
+    my $ld=$recs{$gffid};
+   # my $ld=$recs{$l} || die ("Error: locus $l found in list but not in hash!\n");
+   #     0       1       2       3       4      5         6    7    8     9
+   my ($chr, $strand, $ftype, $gname, $descr, $lstart, $lend, $er, $cr, $score) = @$ld;
+   my ($mstart,$mend)=($lstart, $lend);
+   my $CDexons=0;
+   my @ex;
+   my @cds;
+   if (@$er<1 && @$cr>0) { 
+     @ex = sort { $a->[0] <=> $b->[0] } @$cr;
+     $CDexons=1;
+     }
+    else {
+     @ex = sort { $a->[0] <=> $b->[0] } @$er;
+     if (@$cr>0) {
+       @cds= sort { $a->[0] <=> $b->[0] } @$cr;
+       }
+     }
+   ($mstart, $mend) = ($ex[0]->[0], $ex[-1]->[1]); # get the more accurate version of the start-end coords for the feature
+   my ($cds_start, $cds_end) = ($CDexons || @cds==0) ? ($mstart, $mend) : ($cds[0]->[0], $cds[-1]->[1]) ;
+   my @bstarts;
+   my @blens;
+   foreach my $ed (@ex) {
+     push(@bstarts, $$ed[0]-$mstart);
+     push(@blens, $$ed[1]-$$ed[0]+1);
+     }
+   if ($score) {
+      $tcolor=score2color($score);
+      
+      }
+    else {
+      $score=666;
+      }
+   print join("\t", $chr, $mstart-1, $mend, "$gffid|$gname", $score, $strand, $cds_start-1, $cds_end, 
+       join(',',$tcolor,$tcolor,$tcolor),
+       scalar(@bstarts), join(',', @blens), join(',', @bstarts))."\n";
+  } #for each stored transcript
+}
+
+sub score2color {
+ my $c=int(255-(255.0 * ($_[0]/$tmaxscore)));
+ $c=0 if $c<0;
+ $c=128 if $c>=128;
+ return $c;
+}

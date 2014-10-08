@@ -1,0 +1,1883 @@
+#!/usr/bin/perl
+require 5.8.0;
+use strict;
+use Getopt::Std;
+use File::Basename; #for basename, dirname
+use POSIX "sys_wait_h"; # mostly for the handy uname() function
+use Cwd qw(abs_path cwd);
+use Fcntl qw(:DEFAULT :seek); #mostly for the SEEK constants
+use FindBin; use lib "$FindBin::Bin";
+
+my $NORMAL_ENDING=1; #set to 0 while working, to 1 upon normal ending of script (i.e. no die())
+my $USER=$ENV{USER} || POSIX::cuserid(); #it may not be there for condor workers
+my $PWD=cwd(); #from Cwd module
+my $PERL_BIN='/usr/bin/perl';
+my $MAX_RETRIES=3; #-- how many times to try a failed task
+my $F_WRKCOUNT='.wrkCount'; # count of currently running workers
+my $F_ALLDONE='.all.Done.';
+my $F_WRKSTART='.wrkStarted'; #count of (ever) started workers
+my $F_LASTTASK='.lastTask'; # maximum task# ever started
+my $F_TASKSDONE='tasksDone'; # number of tasks successfully finished
+my $F_ERRTASKS='err.tasks'; #LIST of task#s which returned non-zero status
+                            # even after MAX_RETRIES
+my $F_RETRYTASKS='retry.tasks'; #stack of task#s which returned non-zero status
+                                #less then MAX_RETRIES times
+my $F_WRKRUNNING='.running-worker'; #semaphore file in each worker directory
+my $F_ENDCMD='epilogue';
+my $F_WRKDIR='workdir';
+my $F_NOTIFY='notify';
+my $F_TASKDB='taskDb';
+my $GRID_DEBUG;
+my $starting_dir;
+my $STARTED_GRID_TASK;
+my $SMPChildren=0; #SMP case: number of children running
+my %SMPChildren=(); #set of child PIDs
+my %Locks = (); # filehandle -> [lockfilelink, hostlockfile]
+my $HOSTNAME = (&POSIX::uname)[1]; # can't trust HOST envvar under condor, because
+          # it will either inherit HOST and HOSTNAME from submitter env for getenv=TRUE,
+          # OR it will not set anything for getenv=FALSE
+chomp($HOSTNAME);
+$HOSTNAME=lc($HOSTNAME);
+my $HOST=$HOSTNAME;
+my ($DOMAIN)=($HOST=~m/^[\w\-]+\.(.+)/);
+unless ($DOMAIN) {
+ if ($HOST=~m/^flicker|^wren|^ibis/) { 
+    $DOMAIN='umiacs.umd.edu';
+    }
+ unless ($DOMAIN) {       
+   $DOMAIN=($PWD=~/^\/export|^\/home/) ? 'dfci.harvard.edu' : 'umiacs.umd.edu';
+   }
+ }
+($HOST)=($HOST=~m/^([\w\-]+)/);
+$ENV{HOST}=$HOST;
+$ENV{MACHINE}=$HOST;
+$ENV{HOSTNAME}=$HOSTNAME;
+$ENV{USER}=$USER;
+#&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&! - site specific -
+#---------- modify the SITE-SPECIFIC paths here if needed:
+#&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&! 
+# ===== PATH management ====
+# default: assume architecture/PATH/LIB uniformity across nodes
+# you can change this by adding your own worker/server paths here
+my $binpath=$ENV{PATH};
+my $libpath=$ENV{LD_LIBRARY_PATH};
+my $perllib=$ENV{PERLLIB};
+my $perl5lib=$ENV{PERL5LIB};
+my $pythonpath=$ENV{PYTHONPATH};
+
+# use home directory for symbolic links to working directories
+my $homebase=$ENV{HOME}; 
+$homebase=~s/(\/[^\/]+$)//;
+
+$homebase='/fs/wrenhomes' unless $homebase; #this is just valid for UMIACS here
+# sometimes the HOME path is not defined within the condor job, 
+# please use your own globally mounted path instead
+
+# default grid engine used:
+#my $GRID_ENGINE='sge'; # can also be: 'condor' and 'smp'
+my ($GRID_MONHOME, $GRID_ENGINE) = ($DOMAIN=~/dfci/) ? ('/home', 'sge') 
+                                                      : ($homebase, 'condor');
+my $sysopen_mode = O_RDWR|O_CREAT|O_SYNC;
+#$sysopen_mode |= O_DIRECT if $DOMAIN!~/umiacs/;
+
+#print STDERR "|$GRID_MONHOME|\n";
+#&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&! -
+#
+my $morehints=qq{
+  The following entries will be created by ngridx:
+   <GRID_JOBDIR>/epilogue    - only if -e option was given, a file containing the 
+                               <end_cmd> parameter
+   <GRID_JOBDIR>/notify      - a file containing the e-mail address to notify
+                               if -m was given
+   <GRID_JOBDIR>/.lastTask   - a file keeping track of the last task# scheduled
+   <GRID_JOBDIR>/.wrkStarted - a file keeping track of the number of 
+   <GRID_JOBDIR>/.wrkCount   - a file keeping track of the number of 
+                               currenly running workers
+   <GRID_JOBDIR>/err.tasks   - list of all error-terminated tasks, after retry
+                               (should be zero or empty if all tasks
+                                finished successfully)
+   <GRID_JOBDIR>/retry.tasks - list of all error-terminated tasks that will 
+                                still be retried 
+   <GRID_JOBDIR>/taskDb      - pseudo-fasta db with the info & status 
+                                of each task
+   <GRID_JOBDIR>/taskDb.cidx -  the cdbfasta index of the above db file
+   <GRID_JOBDIR>/locks/      - lockfiles/links are placed here
+   <GRID_JOBDIR>/running/    - while a task is processed, a file entry
+                               called task_<GRID_TASK> will be created in 
+                               here for locking purposes; such file will have
+                               a line with processing info for the current
+                               task: <hostname> <pid> <CPU#>
+   <GRID_JOBDIR>/wrk_<CPU#>/ - working directory exclusive to each worker 
+                               process, one per CPU (1 <= CPU <= maxCPUs); 
+                               also contains stderr and stdout log files 
+                               for each worker process (wrk_stderr.log and
+                               wrk_stdout.log)
+ * if -i option is used, a slice db file is created for <fastadb> with the 
+   positions of all slices of <numseqs> fasta records in the <fastadb> file.
+   This file is called <GRID_JOBDIR>/taskDb
+ * if -b option was given: executes the <begin_script> in the current submit 
+   directory (the one above <GRID_JOBDIR>)
+ * if all tasks completed successfully and if -e option was given 
+   the <end_script> is executed in the <GRID_JOBDIR> subdirectory
+};
+
+my $usage=qq{
+Submit a list of commands to the grid. Can also automatically 
+slice a multi-fasta file into chunks and pass the slice file names as 
+parameters to a <cmd>:
+
+Usage: 
+
+ngridx  \{-f <cmds_file> | -i <fastadb> | -r <numtasks> \} -p <numprocs>
+    \{-U|-u <slot#>\} [-n <numseqs>] [-s <skipseqs>] [-t <totalseqs>]
+    [-g <engine>] [-d <dir_prefix>] [-a] [-M <monitoring_basedir>]
+    [-L <local_wrk_dir>] [-O <log_files_dir>] [-S] [-T] [-v]
+    [-x <node_exclude_list>] [-y <node_targets_list>]
+    [-b <begin_script>] [-e <end_script>] [-q] [-m <e-mail>]
+    [-c] <cmd> [-C] [<cmd_args>..]
+
+Unless -J option is given, ngridx will submit the job to the grid,
+creating a <GRID_JOBDIR> subdirectory (which on Condor has the format: 
+ngridx-<hostname>_<job_id>). A file called 'cmdline-<numtasks>.cmd'
+will also be created there containing the current ngridx commmand line.
+
+Options:
+ -g  grid engine to use, can be 'smp', 'condor' or 'sge' (default: $GRID_ENGINE)
+ -p  maximum number of grid CPUs to allocate for this job
+ -f  provide a file with a list of commands to be run on the grid (one 
+     command per line per CPU)
+ -i  grid processing of slices of the given multi-fasta file <fastadb>; 
+     the total number of tasks/iterations is given by the number of slices 
+     in <fastadb> (and the -n <numseqs> option); the script will 
+     automatically create the slice file in the worker directory before 
+     <cmd> is run with these parameters: 
+     <fastaslice> <numseqs> <slice#> <is_last> <skipped> <total> <cmd_args>
+ -n  slice size: for -i option, how many fasta records from <fastadb> 
+     should be placed into a slice file for each iteration (default: 2000)
+ -C  legacy option for psx-like usage (to pass <cmd_args>)
+ -r  submit an array job with <numtasks> iterations/tasks (default: 1)
+
+ -S  switch to (stay in) the current directory (where ngridx was launched from)
+     before each task execution (especially useful for -f option)
+ -a  (psx legacy): inherit the submitter environment (default)
+ -b  prologue script to be executed BEFORE the grid job is submitted
+ -e  epilogue script to be executed AFTER all the grid tasks were completed,
+     and only if ALL the tasks terminated successfully.
+ -m  send an e-mail to the given address when all tasks are finished
+ -v  do not try to validate <cmd> (assume it is going to be valid on the grid
+     nodes)
+ -x  provide a list of machines (host names) that should be excluded 
+     from the condor pool for this submitted job ('condor' engine only)
+ -y  the submitted job is only allowed to run on the machines on this list
+     ('condor' engine only)
+ -d  create <dir_prefix> prefixed symbolic links to worker directories 
+     in the current directory
+ -O  place all Condor log files (condor stderr/stdout redirects)
+     into <log_files_dir>
+ -M  parent directory for creating a "monitoring" symlink; a symbolic link to 
+     the current <GRID_JOBDIR> will be created there, under 
+     <monitoring_basedir>/$USER/ (default: home directory)
+ -T  do not exit after the job is submitted, wait around instead 
+     until the last worker terminates and prints some job completion stats
+ -U  force one worker per machine (only for 'condor' engine)
+ -u  force each worker to run only on CPU <slot#> (between 1 and 12) of each
+     machine (only for 'condor' engine)
+ For -r option, the provided <cmd> could make use of the environment variables
+ GRID_TASK, GRID_TASKLAST to determine the current iteration being executed. 
+
+ Unless -S option was used, each <cmd> iteration will be executed in its own
+ worker subdirectory <GRID_JOBDIR>/wrk_<CPU#>
+ 
+Job monitoring/resuming/stopping (-J mode):
+
+ ngridx [-m e-mail] [-e <end_script>] [-K|-R] -J <jobID>
+  
+If -J option is provided, ngridx will report the status of the job <jobID>
+which must have been submitted by a previous, "regular" use of ngridx; it relies 
+on the the symbolic link <monitor_basedir>/$USER/ngridx-<jobID> which must
+be valid (<monitor_basedir> can be set by -M).
+
+Additional/alternate actions for -J mode:
+ -e   update the <end_script> for the *running* <jobID> or for the <jobID>
+      rerun (if -R option is also given); does not work with -K option
+ -m   update the e-mail notification option for job <jobID>
+ -K   kill/abandon/terminate ALL pending tasks for grid job jobID
+       (trying to remove all running/pending tasks on the grid)
+ -R   rerun/resubmit all the unfinished/unprocessed or unsuccessful tasks
+      for <GRID_JOB>; this assumes -K -J <JOB_ID> was given first (so there 
+      are no pending tasks) and then will submit a new job in the same working
+      directory, renaming the GRID_JOBDIR accordingly while workers
+      will now *skip* all the tasks found with a "Done" status ('.') in the 
+      <GRID_JOBDIR>/taskDb file
+}; #'
+
+
+RESUME_JOBID:
+my @ar=@ARGV;
+while ($ar[0] eq '-Z') { shift(@ar); shift(@ar); }
+my $CMDLINE="$FindBin::Script\t".join("\t",@ar);
+# parse script options
+print STDERR "Running on $HOST (domain: $DOMAIN): $0 ".join(' ',@ARGV)."\n";
+getopts('USWHM:O:NKRDTqvaJZ:L:u:r:x:y:i:Ff:n:t:d:s:p:m:g:b:e:c:C:') || die($usage."\n");
+umask 0002;
+if ($Getopt::Std::opt_H) {
+ print STDERR $usage;
+ die($morehints."\n"); 
+}
+my $SwitchDir=$Getopt::Std::opt_S;
+$NORMAL_ENDING=0;
+$GRID_DEBUG=$Getopt::Std::opt_D;
+#print STDERR "Host=$HOST, Domain=$DOMAIN\n" if $GRID_DEBUG;
+
+my $GRID_DIRPREFIX=$Getopt::Std::opt_d;
+my ($submitJob, $removeJob);
+$GRID_ENGINE=lc($Getopt::Std::opt_g) if $Getopt::Std::opt_g;
+if ($GRID_ENGINE eq 'sge') {
+ ($submitJob, $removeJob)=(\&submitJob_sge, \&removeJob_sge);
+ }
+elsif ($GRID_ENGINE eq 'condor') {
+ ($submitJob, $removeJob)=(\&submitJob_condor, \&removeJob_condor);
+ }
+elsif ($GRID_ENGINE eq 'smp') {
+ ($submitJob, $removeJob)=(\&submitJob_smp, \&removeJob_smp);
+ }
+else {
+ die("Error: invalid grid engine given (only 'sge', 'condor' or 'smp' are accepted)!\n"); 
+ }
+my $UniqueVM=$Getopt::Std::opt_U; 
+
+my $UniqVMreq=$Getopt::Std::opt_u;
+$UniqVMreq=int($UniqVMreq) if $UniqVMreq;
+die("Error: use either -U or -u option, not both!\n") if $UniqueVM && $UniqVMreq>0;
+# - exclude the following machines
+my @xmachinelist=split(/\,/,$Getopt::Std::opt_x); #do NOT allow jobs to run on these machines
+my @ymachinelist=split(/\,/,$Getopt::Std::opt_y); #only allow jobs to run on these machines, not others
+#submitJob MUST use the globals: 
+# GRID_CMD, GRID_TASKLAST, GRID_MONHOME and update GRID_JOB
+
+$GRID_MONHOME=$Getopt::Std::opt_M if $Getopt::Std::opt_M;
+#$GRID_MONHOME=$ENV{HOME} unless $GRID_MONHOME;
+$GRID_MONHOME.='/'.$USER unless $GRID_MONHOME=~m/$USER$/;
+#
+
+die("Error: directory $GRID_MONHOME should already be created! Aborting..\n")
+ unless (-d $GRID_MONHOME);
+
+my $mailnotify=$Getopt::Std::opt_m;
+#-------- GLOBALs ---------------------------
+my $GRID_JOBDIR;
+my $GRID_JOB;
+my $GRID_LOCKDIR;
+my $GRID_TASKLAST;
+my $GRID_CMD; # user's command and arguments
+my $GRID_CMDFILE=$Getopt::Std::opt_f; # one line per run.. with arguments for command <cmd>
+my $GRID_USECMDLIST=1 if $GRID_CMDFILE || $Getopt::Std::opt_F;
+
+my $GRID_PSXFASTA; #if -i was used
+my $GRID_PSXSTEP; #if -i was used (-n value)
+my $GRID_PSXSKIP=0;  # -s option
+my $GRID_PSXTOTAL=0;  # -t option
+
+my $GRID_NUMPROCS=0;  # -p option
+my $GRID_RESUME=$Getopt::Std::opt_R || $Getopt::Std::opt_Z;
+my $GRID_LOCAL_JOBDIR=$Getopt::Std::opt_L;
+#---------- worker side global vars:
+my $GRID_ENVSET=0;  #was the environment set?
+my $GRID_WORKER=0; #  worker#
+#my $GRID_NOWRKLINKS=1;
+my $GRID_LOGDIR=$Getopt::Std::opt_O;
+my $GRID_TASK; # dynamic -- task iteration#
+my $TASK_ERRCOUNT; # dynamic -- current task error (retry) counter
+my $TASK_DATA; # current task's user data as stored in taskDb
+my $TASK_LOCKH; #file handle for the current task lock file
+my $TASK_LOCKF; #file name for the current task lock file
+my $GRID_WRKDIR; #only for the worker case, it's the current worker's subdirectory
+
+if ($Getopt::Std::opt_J) {
+ #################################################################
+ #                ngridx job monitoring use:
+ #---------------------------------------------------
+ #    ngridx -J [-m <e-mail>] [-M <mondir>] [-R | -K] <jobid>
+ #vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+  my ($jobid)=shift(@ARGV);
+  $jobid=~tr/ //d;
+  unless ($jobid) { # list mode
+   my $fmask="$GRID_MONHOME/ngridx-*";
+   my @jdirs=<${fmask}>;
+   if (@jdirs>0) {
+     print STDOUT "The following jobs were found (in $GRID_MONHOME):\n";
+     foreach (@jdirs) {
+        my ($jobid)=(m/ngridx\-(\w[\w\-]+)$/);
+        print "  $jobid\n";
+        }
+     }
+    else {
+       print STDOUT "No jobs were found (in $GRID_MONHOME).\n";
+     } 
+   $NORMAL_ENDING=1;
+   exit(0);
+   }
+  #a valid $jobid was given, hopefully
+  $jobid=lc($jobid);
+  my $subdir='ngridx-'.$jobid;
+  my $jobdir="$GRID_MONHOME/ngridx-$jobid";
+  unless (-d $jobdir) { #try current directory..
+    if (-d $subdir) {
+      $jobdir=$subdir;
+      }
+     else { 
+      die "No such job found($jobid) - neither $jobdir nor $subdir exist!\n";
+      }
+    }
+  #print STDERR "..found jobdir='$jobdir'\n";
+  chdir($jobdir) || die("Error at chdir($jobdir)!\n");
+  #my $msg=jobSummary($mailnotify);
+  my $msg=jobSummary();
+  print STDOUT $msg."\n";
+  if ($Getopt::Std::opt_K) {
+    &$removeJob($jobid);
+    }
+   elsif ($Getopt::Std::opt_R) { #resume/rerun!
+    #chdir($jobdir) || die("Error at chdir($jobdir)!\n");
+    my @cmdfile=<cmdline-*.cmd>;
+    die "Error getting the cmdline-*.cmd from current directory!\n" 
+       unless @cmdfile;
+    my ($numtasks)=($cmdfile[0]=~m/cmdline\-(\d+)/);
+    die "Error parsing the number of tasks from $cmdfile[0]!\n" unless $numtasks>0;
+    my $cmdline=readFile($cmdfile[0]);
+    chomp($cmdline);
+    my @args=split(/\t/,$cmdline);
+    die("$jobdir/$F_TASKDB and/or index not valid - cannot resume!\n") 
+       unless -s $F_TASKDB && -s "$F_TASKDB.cidx";
+    shift(@args); #discard ngridx command itself
+    chdir('..'); #go in the original working dir
+    $PWD=cwd(); #from Cwd module
+    $CMDLINE="$FindBin::Script\t".join("\t",@args);
+    @ARGV=('-Z',$jobid, @args);
+    undef($Getopt::Std::opt_J);
+    undef($Getopt::Std::opt_R);
+    goto RESUME_JOBID;
+    }
+  $NORMAL_ENDING=1;
+  exit(0);
+ } 
+ elsif ($Getopt::Std::opt_W) {
+##########################################################
+#                ngridx Worker use:
+#---------------------------------------------------------
+# This is the actual job that gets submitted
+#             ngridx -W <cmd> <cmd_args>
+# At runtime the environment should be set accordingly
+#vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+  beginWorker(); #set up environment and worker directory
+                 #(wrk_NNNNN) and chdir() to it
+  $GRID_USECMDLIST=$Getopt::Std::opt_F;
+  my @cmd=@ARGV; # cmd and cmdargs
+  while (my $taskId = getNextTask()) {
+    runTask($taskId, @cmd);
+    }
+  my $runningworkers=endWorker();
+  my $exitcode=0;
+  if ($runningworkers==0) { #this was the last worker!
+    #run any JOB finishing/clean up code
+    chdir($GRID_JOBDIR);
+    my $epilogue=readFile($F_ENDCMD) if -s $F_ENDCMD;
+    if ($epilogue) {
+      chomp($epilogue);
+      #only run it if ALL tasks succeeded
+      my $tasksdone=readFile($F_TASKSDONE);chomp($tasksdone);
+      if ($tasksdone==$GRID_TASKLAST && !(-s $F_ERRTASKS)) {
+        runCmd($epilogue);
+        }
+      }
+    my $notify=readFile($F_NOTIFY) if -s $F_NOTIFY;
+    chomp($notify);
+    jobSummary($notify);
+    local *FDONE;
+    open(FDONE, '>'.$GRID_JOBDIR.'/'.$F_ALLDONE) || die("Error creating $GRID_JOBDIR/$F_ALLDONE\n");
+    print FDONE "done.\n";
+    close(FDONE);
+    } #last worker ending
+$NORMAL_ENDING=1;
+exit(0);
+}# -- worker use case
+
+
+##########################################################
+#                                                 
+#                ngridx Submit use:                
+#                                                 
+##########################################################
+
+my $gridBeginCmd=$Getopt::Std::opt_b;
+my $gridEndCmd=$Getopt::Std::opt_e;
+$GRID_RESUME=$Getopt::Std::opt_Z; #caused by an initial -J -R request
+$GRID_TASKLAST=$Getopt::Std::opt_r;
+#--submit specific globals -- temporary
+my $TASKDB;
+my $JOBID;
+#--
+unless ($GRID_CMDFILE) {
+ $GRID_CMD=$Getopt::Std::opt_c || shift(@ARGV);
+ die "$usage\nError: no command given!\n" unless $GRID_CMD;
+ unless ($Getopt::Std::opt_v) {
+  $GRID_CMD = getCmdPath($GRID_CMD) ||
+    die "Error: command $GRID_CMD not found in PATH!\n";
+  }
+ $GRID_CMD.=' '.$Getopt::Std::opt_C if $Getopt::Std::opt_C;
+ $GRID_CMD.=' '.join(' ',@ARGV) if @ARGV;
+ }
+else {
+ $GRID_CMD='.';
+ } 
+$GRID_NUMPROCS=$Getopt::Std::opt_p || 1; #numer of workers submitted
+
+if ($GRID_PSXFASTA=$Getopt::Std::opt_i) { #psx emulation case
+  die "Error: -r and -i are mutually exclusive options!\n" if $GRID_TASKLAST;
+  $GRID_PSXSTEP=$Getopt::Std::opt_n || 1;
+                                  #it will be moved into GRID_JOBDIR right after submit
+  $GRID_PSXSKIP=$Getopt::Std::opt_s || 0;
+  $GRID_PSXTOTAL=$Getopt::Std::opt_t || 0;
+  #$GRID_NOWRKLINKS=$Getopt::Std::opt_N;
+  }
+ else { $GRID_TASKLAST=1 unless $GRID_TASKLAST; } #one shot run
+prepareTaskDb(); #builds a taskDb in the current directory for now
+                  #checks global $GRID_PSXFASTA and $GRID_PSXSTEP
+                  #sets TASKDB to the file name, and GRID_TASKLAST is updated as needed
+
+if ($gridBeginCmd) {
+ system($gridBeginCmd) && die("Error: exit status $? returned by prologue command: '$gridBeginCmd'\n");
+ }
+$JOBID = &$submitJob({PATH=> $binpath, PYTHONPATH=> $pythonpath,
+    LD_LIBRARY_PATH=>$libpath, PERLLIB=>$perllib, PERL5LIB=>$perl5lib} );
+#-- submitJob should also call setupJobDir() to create the ngridx-<JOBID> subdirectory
+#-- and move/rename the taskDb in there.
+die("Error: no job ID has been obtained!\n") unless $JOBID;
+if ($Getopt::Std::opt_T) { #wait for all children to finish
+ my $wstat;
+ chdir($GRID_JOBDIR);
+ do {
+  sleep(5);
+  } until (-e $F_ALLDONE);
+ my $msg=jobSummary($mailnotify);
+ my $exitcode = (-s $F_ERRTASKS) ? `wc -l $F_ERRTASKS` : 0;
+ chomp($exitcode);
+ print STDOUT $msg."\n";
+ chdir($PWD); #this should be the original working directory
+ $NORMAL_ENDING=1;
+ exit($exitcode);
+ }
+$NORMAL_ENDING=1;
+exit(0);
+# if ($notify) {
+#   #qsub -o /dev/null -N "$cmd-$jobid-($numtasks)-watcher" -hold_jid $jobid -b y -j y $notify sleep 0
+#   my $sgecmd=`which sgepl`;
+#   qsub -o $GRID_MONHOME/.gridjob_$jobid/watcher.log -N "$cmdname-$jobid-($numtasks)-watcher" \
+#   -hold_jid $jobid -b y -j y -V /bin/tcsh -f $sgecmd -Done $cmdname $jobid $numtasks
+#   echo "Submitted watchdog job $cmdname-$jobid-($numtasks)-watcher:"
+#   echo " $sgecmd -Done $cmdname $jobid $numtasks"
+# }
+
+#**********************************************************
+#******************* SUBROUTINES **************************
+
+
+
+#******************** SUBMIT SIDE *************************
+
+=head2 ----------- taskDbRec -----------
+
+taskDbRec($fhdb, $jobId, $command_line..)
+
+Creates (writes) a record into the taskDb file open for writing 
+with the file handle $fhdb. This subroutine takes care of 
+formatting the fixed length defline (header) of the job record.
+
+This subroutine should only be used by the program which 
+creates the taskDb. After all the records are added to the taskDb;
+the taskDb should be eventually indexed with cdbfasta.
+
+=cut
+
+sub taskDbRec {
+ my ($fh, $taskId, @userdata)=@_;
+ my $rec='>'.$taskId."\t{-|-|----|----|--------}\t{".('-' x 25).'}';
+ $rec.="\t".join(' ',@userdata) if @userdata;
+ print($fh $rec."\n");
+}
+
+
+sub prepareTaskDb {
+ if ($GRID_PSXFASTA) { #-i given, psx mode
+  $GRID_PSXFASTA=getFullPath($GRID_PSXFASTA, 1);
+  die ("Error: prepareTaskDb() called with PSXFASTA but no PSXSTEP!\n")
+    unless $GRID_PSXSTEP;
+  my $basename=getFName($GRID_PSXFASTA);
+  $TASKDB='ngridx-psx-'.$basename.
+          ".n$GRID_PSXSTEP.s$GRID_PSXSKIP.t$GRID_PSXTOTAL".'.taskDb';
+  if ($GRID_RESUME) {        
+    #taskDb must already be there!
+    my $r=`cdbyank -s ngridx-$GRID_RESUME/taskDb.cidx`;
+    ($GRID_TASKLAST)=($r=~m/\nNumber of records:\s+(\d+)\n/s);
+    die "Error: couldn't determine number of records in ngridx-$GRID_RESUME/taskDb\n" 
+       unless $GRID_TASKLAST>0;
+   return;
+   }
+
+  #-- iterate through the fasta file, create slice index 
+  # and the index for the slice index..
+  local *TASKDB;
+  local *PSXFASTA;
+  open(PSXFASTA, $GRID_PSXFASTA) || die "Error opening file $GRID_PSXFASTA\n";
+  binmode(PSXFASTA);
+  open(TASKDB, '>'.$TASKDB) || die "Error creating file $TASKDB ($!)\n";
+  my $foffset=0;
+  my $rcount=0;
+  my $numrecs=0;
+  $GRID_TASKLAST=0;
+  while (<PSXFASTA>) {
+    my $linelen=length($_);
+    if (/^>/) {
+      $rcount++;
+      if ($rcount>$GRID_PSXSKIP) {
+          $numrecs++;
+          if (($numrecs-1) % $GRID_PSXSTEP == 0) {
+             $GRID_TASKLAST++;   
+             taskDbRec(\*TASKDB, $GRID_TASKLAST, $foffset);
+             }
+          }
+      last if ($GRID_PSXTOTAL>0 && $numrecs>$GRID_PSXTOTAL);
+      }
+    $foffset+=$linelen;
+    }
+  close(PSXFASTA);
+  #&taskdbRec(\*TASKDB, $GRID_TASKLAST, $foffset)
+  #       unless ($numrecs-1) % $GRID_PSXSTEP == 0;
+  close(TASKDB);
+  }
+ elsif ($GRID_CMDFILE) { # -f option given
+  return if ($GRID_RESUME); #taskDb must already be there!
+  $TASKDB="ngridx.$GRID_CMDFILE.taskDb";
+  local *TASKDB;
+  open(CMDFILE, $GRID_CMDFILE) || die "Error opening file $GRID_CMDFILE\n";
+  open(TASKDB, '>'.$TASKDB) || die "Error creating file $TASKDB ($!)\n";
+  my $i=1;
+  while(<CMDFILE>) {
+    next if m/^\s*#/;
+    chomp;
+    taskDbRec(\*TASKDB, $i, $_);
+    $i++;
+    }
+  close(TASKDB);
+  close(CMDFILE);
+  $GRID_TASKLAST=$i-1;
+  }
+ elsif ($GRID_TASKLAST) { # -r option given
+  return if ($GRID_RESUME); #taskDb must already be there!
+  $TASKDB="ngridx.r$GRID_TASKLAST.taskDb";
+
+  local *TASKDB;
+  open(TASKDB, '>'.$TASKDB) || die "Error creating file $TASKDB ($!)\n";
+  for (my $i=1;$i<=$GRID_TASKLAST;$i++) {
+    taskDbRec(\*TASKDB, $i, $GRID_CMD);
+    }
+  close(TASKDB);
+  }
+ else { return; } 
+runCmd("cdbfasta $TASKDB");
+}
+
+sub getFName {
+ return basename($_[0]);
+}
+
+sub getFDir {
+ return dirname($_[0]);
+}
+
+sub getFullPath {
+ my ($fname, $check)=@_;
+ die("Error: file $fname does not exist!\n") if $check && !-r $fname;
+ return abs_path($fname); #Cwd module
+}
+
+#== getCmdPath -- checks for executable in the PATH if no full path given
+# tests if the executable is a text file and interpreter was requested
+sub getCmdPath {
+ my $cmd=$_[0];
+ my $fullpath;
+ my $checkBinary=wantarray();
+ if ($cmd =~ m/^\//) {
+   $fullpath = (-x $cmd) ? $cmd : '';
+   }
+  elsif ($cmd =~ m/^\.+\//) { #relative path given
+   $fullpath= (-x $cmd) ? abs_path($cmd) : '';
+   }
+  else { #we search in the path..
+    my @paths=split(/:/, $ENV{'PATH'});
+   foreach my $p (@paths) {
+     if (-x $p.'/'.$cmd) {
+        $fullpath=$p.'/'.$cmd;
+        last;
+        }
+     }
+   }#path searching
+ if ($checkBinary) { #asked for interpreter, if any
+   if ($fullpath) {
+     my $interpreter='';
+     if (-r $fullpath && -T $fullpath) {#readable text file, look for bang line
+       open(TFILE, $fullpath);
+       my $linesread=1;       
+       while ($linesread<10) {#read only the first 10 lines..
+         $_=<TFILE>;
+         chomp;
+         if (m/^\s*#\!\s*(\S.+)/) {
+           $interpreter=$1;
+           last;
+           }
+         $linesread++;
+         }
+       $interpreter=~s/\s+$//;
+       }
+     return ($fullpath, $interpreter);
+     }
+    else { return (); } #cmd not found;
+   }
+  else { return $fullpath; }
+}
+
+sub runCmd {
+my ($cmd, $jobid)=@_;
+my $exitstatus=system($cmd);
+if ($exitstatus != 0) {
+    if ($jobid) {
+      &$removeJob($jobid);
+      }
+   die("Error at running system command: $cmd\n");
+   }
+}
+
+
+sub removeJob_sge {
+ my $jobid=shift(@_);
+ runCmd("qdel -f $jobid");
+}
+
+sub removeJob_condor {
+ my $jobid=shift(@_); #machine+'_'+job#
+ #must be on the same machine that submit was issuedlh
+ my ($hostname, $job)=($jobid=~m/([\w\-]+)_(\d+)$/);
+ die("Error parsing hostname, job# from $jobid!\n") 
+    unless $hostname && ($job>0);
+ #print STDERR "$hostname, $HOST, $jobid, $job\n";
+ if (lc($hostname) eq lc($HOST)) { #local host
+   runCmd("condor_rm $job");
+   }
+  else { 
+   runCmd("condor_rm -name $hostname $job");
+   }
+}
+
+
+sub smpTaskReaper {   # takes care of dead children      $SIG{CHLD} = \&taskReaper;
+  my $childpid;
+  while (($childpid = waitpid(-1, WNOHANG)) > 0) {
+   $SMPChildren --;
+   delete $SMPChildren{$childpid};
+   }
+  $SIG{CHLD}=\&smpTaskReaper; 
+}
+  
+sub smpTaskKiller {               # signal handler for SIGINT
+  local($SIG{CHLD}) = 'IGNORE';   # we're going to kill our children
+  kill 'INT' => keys %SMPChildren;
+ }
+
+sub removeJob_smp {
+ taskKiller();
+ 
+}
+
+sub submitJob_sge {
+my ($envhash)=@_;
+# submit and array job, SGE style
+my $array='';
+if ($GRID_NUMPROCS > 1) {
+ $array="-t 1-$GRID_NUMPROCS";
+ }
+#append our GRID_ environment
+my $envparam="-v 'GRID_ENGINE=sge,".
+             "GRID_JOBDIR=$PWD,".
+             "GRID_TASKLAST=$GRID_TASKLAST,".
+             "GRID_MONHOME=$GRID_MONHOME,".
+             "GRID_CMD=$GRID_CMD,".
+             "GRID_DIRPREFIX=$GRID_DIRPREFIX";
+$envparam.=",GRID_RESUME=$GRID_RESUME" if $GRID_RESUME;
+$envparam.=",GRID_PSXFASTA=$GRID_PSXFASTA".
+           ",GRID_PSXSTEP=$GRID_PSXSTEP" if $GRID_PSXFASTA;
+$envparam.= ",GRID_PSXSKIP=$GRID_PSXSKIP" if $GRID_PSXSKIP;
+$envparam.= ",GRID_PSXTOTAL=$GRID_PSXTOTAL" if $GRID_PSXTOTAL;
+$envparam.= ",GRID_LOCAL_JOBDIR=$GRID_LOCAL_JOBDIR" if $GRID_LOCAL_JOBDIR;
+if (keys(%$envhash)>0) {
+ $envparam.=',';
+ my @envars;
+ while (my ($env, $val)= each(%$envhash)) {
+   push(@envars, $env.'='.$val);
+   }
+ #$envparam.=" '".join(',',@envars)."'";
+ $envparam.=join(',',@envars);
+ }
+$envparam.="'";
+#--
+
+my $sub="qsub -cwd -b y $envparam";
+#$sub.="-e $errout" if $errout;
+#$sub.="-o $stdout" if $stdout;
+my $logdir='';
+ if ($GRID_LOGDIR) {
+   #separate log dir given
+   $logdir=$GRID_LOGDIR;
+   if (-d $GRID_LOGDIR) {
+     print STDERR "Warning: log dir $GRID_LOGDIR exists; existing files will be overwritten!\n";
+     }
+   else {
+     mkdir($logdir) || die("Error creating log dir '$logdir'!\n");
+     }
+   $logdir.='/' unless $logdir=~m/\/$/;
+   }
+my $otherflags='';
+$otherflags.=' -D' if $GRID_DEBUG;
+#$otherflags.=' -N' if $GRID_NOWRKLINKS;
+$otherflags.=' -F' if $GRID_USECMDLIST;
+$otherflags.=' -S' if $SwitchDir;
+my $subcmd= "$sub $array $PERL_BIN $0 $otherflags -W $GRID_CMD";
+print STDERR "$subcmd\n" if $GRID_DEBUG;
+my $subout = `$subcmd`;
+#print STDOUT $subout;
+#my ($jobid)=($subout=~/Your\s+job\S*\s+(\d+)/s); 
+my ($jobid)=($subout=~/Your\s+job\S*\s+(\d+)/s); 
+die "Error: No Job ID# could be parsed!\n($subout)" unless ($jobid);
+
+setupJobDir($jobid);
+
+return $jobid;
+}
+
+
+sub submitJob_smp {
+my ($envhash)=@_;
+my $jobid='smp_'.$$;
+$ENV{GRID_ENGINE}='smp';
+@ENV{'GRID_JOBDIR', 'GRID_TASKLAST', 'GRID_MONHOME', 'GRID_CMD','GRID_DIRPREFIX'}=
+($PWD."/ngridx-$jobid", $GRID_TASKLAST, $GRID_MONHOME, $GRID_CMD,$GRID_DIRPREFIX);
+$ENV{GRID_RESUME}=$GRID_RESUME;
+$ENV{GRID_JOB}=$jobid;
+@ENV{'GRID_PSXFASTA','GRID_PSXSTEP'}=($GRID_PSXFASTA, $GRID_PSXSTEP) if $GRID_PSXFASTA;
+$ENV{GRID_PSXSKIP}=$GRID_PSXSKIP if $GRID_PSXSKIP;
+$ENV{GRID_PSXTOTAL}=$GRID_PSXTOTAL if $GRID_PSXTOTAL;
+
+$ENV{GRID_LOCAL_JOBDIR}=$GRID_LOCAL_JOBDIR."/ngridx-$jobid" if $GRID_LOCAL_JOBDIR;
+if (keys(%$envhash)>0) {
+ while (my ($env, $val)= each(%$envhash)) {
+   $ENV{$env}=$val;
+   }
+ }
+# Fork off the children
+my $pid;
+setupJobDir($jobid); #we do this one in advance..
+$SIG{CHLD}=\&smpTaskReaper;
+print STDERR "..forking $GRID_NUMPROCS workers..\n" if $GRID_DEBUG;
+my $logdir='';
+if ($GRID_LOGDIR) {
+   #separate log dir given
+   $logdir=$GRID_LOGDIR;
+   if (-d $GRID_LOGDIR) {
+     print STDERR "Warning: log dir $GRID_LOGDIR exists; existing files will be overwritten!\n";
+     }
+   else {
+     mkdir($logdir) || die("Error creating log dir '$logdir'!\n");
+     }
+   $logdir.='/' unless $logdir=~m/\/$/;
+   }
+ my $otherflags;
+ $otherflags=' -D' if $GRID_DEBUG;
+ #$otherflags.=' -N' if $GRID_NOWRKLINKS;
+ $otherflags.=' -F' if $GRID_USECMDLIST;
+ $otherflags.=' -S' if $SwitchDir;
+
+ for (1 .. $GRID_NUMPROCS) {
+  die "Error at fork: $!" unless defined ($pid = fork);
+  if ($pid) { # Parent here
+        $SMPChildren{$pid} = 1;
+        $SMPChildren++;
+        next;
+      } else { #Child here
+          # Child can *not* return from this subroutine.
+          #$SIG{INT} = 'DEFAULT';      # make SIGINT kill us as it did before
+          exec("$PERL_BIN $0 $otherflags -W $GRID_CMD"); #never returns
+      }
+   }
+$SIG{INT}=\&smpTaskKiller;
+$SIG{TERM}=\&smpTaskKiller;
+return $jobid;
+}
+
+sub submitJob_condor {
+ my ($envhash)=@_;
+ my $jobid;
+ my $queue='queue';
+ $queue.=" $GRID_NUMPROCS" if ($GRID_NUMPROCS > 1);
+ #append our GRID_ environment
+ my $dprefix="ngridx-$HOST".'_';
+ my $envparam="GRID_ENGINE=condor;".
+              "GRID_JOBDIR=$PWD/$dprefix\$(Cluster);".
+              "GRID_JOB=$HOST\_\$(Cluster);".
+              "GRID_TASKLAST=$GRID_TASKLAST;".
+              "GRID_MONHOME=$GRID_MONHOME;".
+              "GRID_CMD=$GRID_CMD;".
+              "GRID_DIRPREFIX=$GRID_DIRPREFIX";
+ $envparam.=";GRID_RESUME=$GRID_RESUME" if $GRID_RESUME;
+ $envparam.=";GRID_PSXFASTA=$GRID_PSXFASTA".
+            ";GRID_PSXSTEP=$GRID_PSXSTEP" if $GRID_PSXFASTA;
+ $envparam.= ";GRID_PSXSKIP=$GRID_PSXSKIP" if $GRID_PSXSKIP;
+ $envparam.= ";GRID_PSXTOTAL=$GRID_PSXTOTAL" if $GRID_PSXTOTAL;
+ $envparam.=';BLASTMAT='.$ENV{BLASTMAT} if $ENV{BLASTMAT};
+ $envparam.= ";GRID_LOCAL_JOBDIR=$GRID_LOCAL_JOBDIR/$dprefix\$(Cluster);" if $GRID_LOCAL_JOBDIR;
+ if (keys(%$envhash)>0) {
+  $envparam.=';';
+  my @envars;
+  while (my ($env, $val)= each(%$envhash)) {
+    push(@envars, $env.'='.$val);
+    }
+  $envparam.=join(';',@envars);
+  }
+ my $logdir='';
+ if ($GRID_LOGDIR) {
+   #separate log dir given
+   $logdir=$GRID_LOGDIR;
+   if (-d $GRID_LOGDIR) {
+     print STDERR "Warning: log dir $GRID_LOGDIR exists; existing files will be overwritten!\n";
+     }
+   else {
+     mkdir($logdir) || die("Error creating log dir '$logdir'!\n");
+     }
+   $logdir.='/' unless $logdir=~m/\/$/;
+   }
+ my $otherflags;
+ $otherflags=' -D' if $GRID_DEBUG;
+ #$otherflags.=' -N' if $GRID_NOWRKLINKS;
+ $otherflags.=' -F' if $GRID_USECMDLIST;
+ $otherflags.=' -S' if $SwitchDir;
+
+ my $mtime=time();
+ my $cmdfile="condor.$$.t$mtime.$USER.$HOST.cmd";
+ local *CMDFILE;
+ open(CMDFILE, '>'.$cmdfile) || die "Cannot create $cmdfile!\n";
+ my $requirements = '(OpSys == "LINUX") && (Arch == "INTEL"  || Arch == "x86_64")';
+ #my $requirements = '(OpSys == "LINUX") && (Arch == "INTEL")';
+ my $force_slot;
+ if ($UniqVMreq>0) {
+   $force_slot=$UniqVMreq;
+   }
+  elsif ($UniqueVM) {
+   $force_slot=3+int(rand(9)); #this is messed up, only works on >11 core machines
+   }
+ $requirements .= ' && (VirtualMachineId == '.$force_slot.')' if $force_slot;
+ if (@xmachinelist>0) {
+   #map { $_='Machine != "'.$_.'.'.$DOMAIN.'"' } @xmachinelist;
+   #$requirements.= ' && ('.join(' && ',@xmachinelist).')';
+   if (@xmachinelist==1 && ($xmachinelist[0]=~tr/|^?*\\//)) {
+      $requirements.=' && (TRUE != regexp("'.$xmachinelist[0].'", Machine, "i"))';
+      }
+    else {  
+      $requirements.=' && (TRUE != regexp("^('.join('|',@xmachinelist).
+                              ')\..*", Machine, "i"))'
+      }
+   }
+ elsif (@ymachinelist>0) {
+   if (@ymachinelist==1 && ($ymachinelist[0]=~tr/|^?*\\//)>0) {
+     $requirements.=' && regexp("'.$ymachinelist[0].'", Machine, "i")';
+     }
+    else {  
+     #map { $_='Machine == "'.$_.'.'.$DOMAIN.'"' } @ymachinelist;
+     #$requirements.= ' && ('.join(' || ',@ymachinelist).')';
+     $requirements.=' && regexp("^('.join('|',@ymachinelist).
+                              ')\..*", Machine, "i")'
+     }
+   }
+ print CMDFILE qq{universe = vanilla
+requirements = $requirements
+notification = Never
+executable = $0
+initialdir = $PWD
+};
+if ($logdir) {
+  print CMDFILE "error  = ${logdir}log_$dprefix\$(Cluster).\$(Process).stderr\n".
+                "output = ${logdir}log_$dprefix\$(Cluster).\$(Process).stdout\n";
+}
+ print CMDFILE "arguments = $otherflags -W $GRID_CMD\n".
+               "environment = $envparam;\n".
+               "$queue\n";
+ close(CMDFILE);
+ my $subcmd="condor_submit $cmdfile";
+ my $subout = `$subcmd`;
+ ($jobid)=($subout=~/submitted\s+to\s+cluster\s+(\d+)\./s);
+ die "Error: No Job ID# could be parsed!\n($subout)" unless ($jobid); 
+ $jobid=$HOST.'_'.$jobid;
+ setupJobDir($jobid);
+ #setupJobDir also chdirs() in the $GRID_JOBDIR
+ system("mv ../$cmdfile condor_submit.cmd");
+ return $jobid;
+}
+
+sub jobDie {
+ my $jobid=shift @_;
+ print STDERR "Error: ".join("\n",@_)."\n";
+ &$removeJob($jobid);
+ die();
+ }
+
+sub setupJobDir {
+my ($jobid)=@_;
+my $jobdir = "ngridx-$jobid";
+jobDie($jobid, "job directory $jobdir already exists!") 
+  if (-d $jobdir);
+if ($GRID_RESUME) {
+  my $prevjobdir='ngridx-'.$GRID_RESUME;
+  print STDERR "  ..taking over jobdir: $prevjobdir\n";
+  unlink("$GRID_MONHOME/$prevjobdir") || warn("  couldn't unlink $GRID_MONHOME/$prevjobdir");
+  unlink("$prevjobdir/$F_LASTTASK");
+  unlink("$prevjobdir/$F_ALLDONE");
+  rename("$prevjobdir/$F_ERRTASKS", "$prevjobdir/prev_$F_ERRTASKS");
+  unlink("$prevjobdir/$F_RETRYTASKS");
+  system("/bin/rm -rf $prevjobdir/wrk_*/$F_WRKRUNNING");
+  system("/bin/rm -rf $prevjobdir/.wrk*");
+  system("/bin/rm -rf $prevjobdir/locks");
+  system("/bin/rm -rf $prevjobdir/running");
+  system("mv $prevjobdir $jobdir") &&
+    jobDie($jobid, "cannot 'mv $prevjobdir $jobdir' - $! - Resuming failed!");
+  }
+else {
+  mkdir($jobdir) || jobDie($jobid, "cannot create subdirectory $jobdir");
+  runCmd("mv $TASKDB $jobdir/taskDb", $jobid);
+  runCmd("mv $TASKDB.cidx $jobdir/taskDb.cidx", $jobid);
+  }
+
+mkdir("$jobdir/locks") || jobDie($jobid, 
+                            "cannot create subdirectory $jobdir/locks");
+mkdir("$jobdir/running") || jobDie($jobid, 
+                            "cannot create subdirectory $jobdir/running");
+if ($GRID_MONHOME ne $PWD) {                            
+ symlink("$PWD/$jobdir", "$GRID_MONHOME/$jobdir")
+    || jobDie($jobid, "cannot symlink $GRID_MONHOME/$jobdir");
+ }
+#- CHDIR to the new GRID_JOBDIR
+chdir($jobdir) || jobDie($jobid, "cannot chdir($jobdir) (from $PWD)!");
+readFile($F_TASKSDONE);
+my $cmdfile="cmdline-$GRID_TASKLAST.cmd";
+local *FHND;
+open(FHND, ">$cmdfile") || jobDie($jobid, "cannot create file $cmdfile\n");
+print FHND $CMDLINE."\n";
+close(FHND);
+open(FHND, ">$F_WRKDIR");
+print FHND "$PWD/$jobdir\n";
+close(FHND);
+
+if ($mailnotify) {
+  open(FHND, ">$F_NOTIFY");
+  print FHND "$mailnotify\n";
+  close(FHND);
+  }
+
+if ($gridEndCmd) {
+  open(FHND, ">$F_ENDCMD") || die("Error creating file $jobdir/.$F_ENDCMD ($!)\n");
+  print FHND $gridEndCmd."\n";
+  close(FHND);
+  }
+$GRID_JOBDIR = "$PWD/$jobdir";
+print STDOUT "Job $jobid scheduled to run with GRID_JOBDIR = $PWD/$jobdir\n";
+} #setupJobDir
+
+
+sub jobSummary {
+my ($mail) = @_;
+#assuming we're in GRID_JOBDIR directory 
+#(either directly or by $GRID_MONHOME)!
+die "Error: cannot locate $F_TASKSDONE and $F_WRKDIR in current directory ($ENV{PWD})!\n"
+ unless -f $F_TASKSDONE && -f $F_WRKDIR;
+my $tasksdone=readFile($F_TASKSDONE);chomp($tasksdone);
+$tasksdone=0 unless $tasksdone;
+my $wrkdir=readFile($F_WRKDIR);chomp($wrkdir);
+my ($jobid)=($wrkdir=~m/\/ngridx\-(\w[\w\-]+)$/);
+die("Error: cannot parse jobid from $F_WRKDIR content ($wrkdir)\n") unless $jobid;
+my @cmdfile=<cmdline-*.cmd>;
+die "Error getting the cmdline-*.cmd from current directory!\n" 
+  unless @cmdfile;
+my ($numtasks)=($cmdfile[0]=~m/cmdline\-(\d+)/);
+die "Error parsing the number of tasks from $cmdfile[0]!\n" unless $numtasks>0;
+open(CMDFILE, $cmdfile[0]);
+my $cmdline=<CMDFILE>;
+chomp($cmdline);
+$cmdline=~s/\t/ /g;
+close(CMDFILE);
+unlink($F_NOTIFY) if -s $F_NOTIFY;
+my ($msg, $subj);
+my $sig='';
+if ($mail) {
+ $sig = "\n\n-------------------------\n -= mail sent from $HOST";
+ $sig.=" (worker $GRID_WORKER)" if $GRID_WORKER; 
+ $sig.=" \nWorking directory: $wrkdir]\n" if $wrkdir;
+ $sig.=" \nCommand line: \n $cmdline\n" if $cmdline;
+ $sig.=" =-\n";
+ }
+if ($tasksdone!=$numtasks) {
+     $msg="Summary of ngridx job $jobid: $tasksdone tasks done out of $numtasks\n".
+                      "Check $wrkdir for more details.\n";
+     $subj="ngridx job $jobid (done $tasksdone out of $numtasks)";
+     }
+ else{
+     $msg="ngridx job $jobid - done all $numtasks tasks\n";
+     $subj="ngridx job $jobid Done (all $numtasks tasks)";
+      }
+$msg.=$sig;
+send_mail( { to=>$mail, subj=>$subj, body=>$msg }) if $mail;
+return $msg;
+}
+
+
+
+############## WORKER SIDE subroutines #####################
+
+#=================== taskDB handling =================
+
+=head2  taskDbStat (taskdb, taskId [,tstatus, cpu#, host, retries, exitcode])
+
+taskDbStat($taskdb, $taskId, [, $taskstatus, $CPUno, 
+                                   $host, $retrycount, $exitcode])
+
+gets/sets the status of a task in an existing taskdb file
+
+If only $taskdb and $taskId parameters are given it works 
+as a getter and returns the whole $taskdb entry, either as a raw 
+string or, if wantarray(), as:
+
+($taskstatus, $userdata, $CPUno, $host, $lastexitcode, $startTime, $retrycount)
+
+..where $startTime is in minutes since the epoch (time/60)
+
+If more than 2 parameters are given, it is a setter for the task status 
+and the other task related data.
+
+Valid status values: 
+   '-' = queued/idle/unprocessed
+   'r' = running (could be a retry)
+   '.' = finished successfully
+   'E' = finished with error ending (after max retries)
+
+Internal details:
+-Each record is assumed locked at the time of writing 
+ (no other processes are trying to update the same task record).
+-A taskdb record format is: 
+
+>taskId\t{S|R|xxxx|dddd|mmmmmmmm}\t{hostname}[\t<additional data..>]
+
+where:
+  S        = running status ('-','r','.' or 'E')
+  R        = retry counter (0-9)
+  xxxx     = last exit code, in hex
+  dddd     = last CPU number, in hex (the wrk_<CPU> subdirectory)
+  mmmmmmmm = start minute since the epoch (time/60) in hexadecimal
+  hostname = fixed 25 char length machine name 
+           (blank padded as needed)
+
+Error protocol for the setter: when given $status is 'E'
+the retry counter is incremented and the actual status 
+would be updated to 'E' if > $maxRetries, or back to '-' otherwise.
+
+=cut
+
+sub taskDbStat {
+ my ($taskdb, $entry, $status, $dirno, $machine, $errcount, $exitcode)=@_;
+ my $taskdbidx=$taskdb;
+ $taskdbidx.='.cidx' unless ($taskdb=~s/\.cidx$//);
+ my $tdberr="taskDbStat(".join(',',@_).") Error:";
+ wrkDie("$tdberr db $taskdb (and/or index) not found!".
+     "(pwd = $ENV{PWD})") unless (-e $taskdb && -e $taskdbidx);
+ wrkDie("$tdberr no entry given!") unless $entry;
+ local *TASKDB;
+ my $dbpos= `cdbyank -a '$entry' -P $taskdbidx`;
+ chomp($dbpos);
+ wrkDie("$tdberr at retrieving pos of entry $entry\n")
+    if ($? || $dbpos!~/^\d+$/);
+    
+ my $openmode = O_RDONLY | O_SYNC ;
+ if ($status) { # setter code:
+   wrkDie("$tdberr invalid update parameters ($status)")
+      if (length($status)>1 || ($dirno && ($dirno>65535 || $dirno<1)));
+   $openmode= O_RDWR | O_SYNC; # | O_DIRECT might be needed ?
+   }
+ sysopen(TASKDB, $taskdb, $openmode) ||
+  wrkDie("$tdberr sysopening $taskdb failed!");
+ binmode(TASKDB);
+ unless (sysseek(TASKDB, $dbpos, SEEK_SET)) {
+    close(TASKDB);
+    wrkDie("$tdberr at sysseek() to $dbpos for $entry");
+    }
+  #----- read the next line and check the format
+  my $targetstr='>'.$entry."\t{-|-|----|----|--------}\t{".('-' x 25)."}";
+  local $/="\n";
+  my $dbline=readline(*TASKDB);
+  binmode(TASKDB);
+  my ($pentry, $pstats, $pmachine, $userdata)=
+    split(/\t/,$dbline,4);
+  chomp($pmachine);chomp($userdata);  
+  my $tcheck=join("\t",$pentry,$pstats,$pmachine);
+  if ($pentry ne '>'.$entry  || 
+      length($tcheck)!=length($targetstr)) {
+    close(TASKDB);
+    wrkDie("$tdberr invalid record format for '$entry' ".
+                 "pos $dbpos, Found:\n'$tcheck'\n ..instead of:\n'$targetstr'\n");
+    }
+  
+  $pmachine=~tr/{} //d;
+  $pstats=~tr/{}//d;
+  my ($pstatus, $pfcount, $pxcode, $pdirno, $ptime)=split(/\|/,$pstats);
+  $ptime=hex($ptime) || $ptime;
+  $pfcount=0 unless $pfcount>0;
+  #----
+  if ($status) { #---- setter code:
+     $status=lc($status);
+     if ($status!~/^[\-r\.e]$/) {
+       close(TASKDB);
+       wrkDie("$tdberr invalid status provided ($status)!");
+       }
+     $dbpos+=length(">$entry\t{");
+     sysseek(TASKDB, $dbpos, SEEK_SET);
+     if (defined($exitcode)) {
+       $pxcode = $exitcode>0 ? sprintf('%04x', $exitcode) : $pxcode;
+       }
+     
+     $pfcount=$errcount if defined($errcount);
+     if ($status eq 'r') { #mark this entry as "running"
+      $ptime=sprintf('%08x',int(time()/60));
+      $pxcode='----';
+      }
+     elsif ($status eq '-') { # mark this entry as "available" (idle)
+      $ptime='--------';
+      }
+     $pmachine=$machine if $machine;
+     $pmachine=sprintf('%25s',$pmachine);
+     $dirno=$pdirno unless $dirno>=1;
+     my $wstr=$status.'|'.int($pfcount).
+         '|'.$pxcode.
+         '|'.sprintf('%04x', $dirno).
+         '|'.$ptime."}\t{".$pmachine.'}';
+     if (length($ptime)>8) {
+       die("Error writing into taskDb record, ptime='$ptime' is too long when writing:\n".
+         "$wstr\n");
+       }
+     my $wlen=length($wstr);
+     my $w=syswrite(TASKDB, $wstr, $wlen);
+     binmode(TASKDB); # 'cause this flushes any pending I/O buffers
+     if ($w!=$wlen) {
+       close(TASKDB);
+       wrkDie("$tdberr failed writing '$wstr' for $entry!");
+       }
+     close(TASKDB);
+     return 1;
+     } # setter
+ else { # getter code
+  close(TASKDB);
+  if (wantarray()) { #retrieve the parsed list of values
+    return ($pstatus, $userdata, hex($pdirno), $pmachine, int($pfcount), 
+                      hex($pxcode), $ptime);
+    }
+  else { #return the raw taskDb line
+    return($dbline);  
+    }
+  } # getter 
+}
+
+
+sub gridWorkerEnv {
+ if ($_[0]) {
+   $GRID_TASK=$_[0];
+   $ENV{GRID_TASK}=$_[0];
+   }
+ return if $GRID_ENVSET;
+ my $gridengine=lc($ENV{GRID_ENGINE});
+   ( $GRID_JOBDIR, $GRID_TASKLAST, $GRID_RESUME,  $GRID_MONHOME, $GRID_LOCAL_JOBDIR,
+    $GRID_PSXFASTA, $GRID_PSXSTEP, $GRID_PSXSKIP, $GRID_PSXTOTAL, $GRID_DIRPREFIX, )=
+ @ENV{'GRID_JOBDIR','GRID_TASKLAST','GRID_RESUME','GRID_MONHOME', 'GRID_LOCAL_JOBDIR',
+    'GRID_PSXFASTA','GRID_PSXSTEP','GRID_PSXSKIP','GRID_PSXTOTAL', 'GRID_DIRPREFIX'};
+ if ($gridengine eq 'sge') {
+   #can't have dynamic environment variables in SGE
+   $GRID_JOB=$ENV{JOB_ID};
+   #only static ones have been prepared (GRID_ENGINE, GRID_TASKLAST)
+   #   with GRID_JOBDIR initially set to the submit working directory
+   $GRID_JOBDIR.='/ngridx-'.$GRID_JOB;
+
+   $GRID_LOCAL_JOBDIR.='/ngridx-'.$GRID_JOB if $GRID_LOCAL_JOBDIR;
+   $GRID_PSXFASTA=$ENV{GRID_PSXFASTA};
+   $GRID_PSXSTEP=$ENV{GRID_PSXSTEP};
+   #dynamic ones are built now from SGE ones
+   $ENV{GRID_JOBDIR}=$GRID_JOBDIR;
+   $ENV{GRID_JOB}=$GRID_JOB;
+   $ENV{GRID_LOCAL_JOBDIR}=$GRID_LOCAL_JOBDIR;
+   }
+  elsif ($gridengine eq 'condor' || $gridengine eq 'smp') {
+   #condor should have all the environment in order
+   $GRID_JOB=$ENV{GRID_JOB};
+   }
+   else {
+     die("Error: Invalid GRID_ENGINE (Is this a valid worker run?)\n");
+     }
+  $GRID_LOCKDIR=$GRID_JOBDIR.'/locks';
+  $GRID_ENVSET=1;
+}
+
+sub beginWorker { 
+ gridWorkerEnv(); #setup the worker environment
+ my $maxretries=5; #just give some time for the submit script to catch up
+ my $chdir=0;      # (only if execution of a submitted task is extraordinarily fast)
+ my $retries=0;
+ while (!($chdir=chdir($GRID_JOBDIR))) {
+   sleep(1);
+   $retries++;
+   last if $retries==$maxretries;
+   }
+ die("Worker error: cannot chdir to $GRID_JOBDIR") unless $chdir;
+ # -- we are in GRID_JOBDIR now!
+ my $errmsg="Worker PID $$ ($GRID_WORKER) aborted on $HOST..\n";
+ my $fh=setXLock($F_WRKSTART,120) || die $errmsg; #update the count of started workers
+ $GRID_WORKER=incFValue($fh, $F_WRKSTART);
+ endXLock($fh);
+ print STDERR "D: worker $GRID_WORKER assigned to host $HOST pid $$ at ".getTime()."\n" if $GRID_DEBUG;
+ $GRID_WRKDIR=sprintf("wrk_%04d",$GRID_WORKER);
+ $starting_dir=$GRID_JOBDIR;
+ $starting_dir=~s/[^\/]+\/?$//;
+ if ($GRID_LOCAL_JOBDIR) {   
+   print STDERR "D: creating local dir on $HOST: $GRID_LOCAL_JOBDIR/$GRID_WRKDIR\n" if $GRID_DEBUG;
+   mkdir("$GRID_LOCAL_JOBDIR") unless -d $GRID_LOCAL_JOBDIR;
+   system("/bin/rm -f $GRID_LOCAL_JOBDIR/$GRID_WRKDIR");
+   mkdir("$GRID_LOCAL_JOBDIR/$GRID_WRKDIR") unless -d $GRID_LOCAL_JOBDIR;
+   wrkDie("Error: couldn't create local worker directory $GRID_LOCAL_JOBDIR/$GRID_WRKDIR on $HOST!\n") 
+      unless (-d "$GRID_LOCAL_JOBDIR/$GRID_WRKDIR");
+   }
+ #-- also updates the "currently running" counter
+ unless (-d "$GRID_JOBDIR/$GRID_WRKDIR") { #worker directory doesn't exist
+   unless (mkdir("$GRID_JOBDIR/$GRID_WRKDIR")) {
+     die "Error at mkdir $GRID_JOBDIR/$GRID_WRKDIR ($!)!\n";
+     }
+   }
+  else { #existing working directory
+   my $frunning= "$GRID_WRKDIR/$F_WRKRUNNING";
+   if (-f $frunning) { #weird -- should never happen..
+     die "Error: another process running in $GRID_WRKDIR?!\n".`cat $frunning`."$errmsg\n";
+    }
+   else { #normal case: no worker-running semaphore there already
+    local *RSEM;
+    open(RSEM, '>'.$frunning) || die "Error creating $frunning file! ($!)\n$errmsg";
+    print RSEM join(" ",int(time()/60), $HOST, $$)."\n";
+    close(RSEM);
+    }
+   }
+  if ($GRID_DIRPREFIX) {
+   my $gwrkdir="../$GRID_DIRPREFIX".'_'.$GRID_WORKER;
+   unlink($gwrkdir);
+   symlink("ngridx-$GRID_JOB/$GRID_WRKDIR", $gwrkdir) ||
+      print STDERR "Warning: cannot symlink ngridx-$GRID_JOB/$GRID_WRKDIR to $gwrkdir ($!)\n";
+         #needed by PSX emulation
+   }
+ # we are in GRID_JOBDIR now - descend into wrk_<GRID_WORKER>
+ $fh=setXLock($F_WRKCOUNT,70,3) || die $errmsg; # update the count of running workers
+ incFValue($fh, $F_WRKCOUNT);
+ endXLock($fh);
+ chdir("$GRID_JOBDIR/$GRID_WRKDIR") ||
+     die "Error at chdir($GRID_JOBDIR/$GRID_WRKDIR) ($!)\n";
+
+ open(STDERR, ">wrk_err.log");
+ print STDERR "worker $GRID_WORKER fully assigned to host $HOST PID $$\n" if $GRID_DEBUG;
+ open(STDOUT, ">wrk_log.log");
+ local *WRKGRAB;
+ open(WRKGRAB, ">.on_$HOST");
+ print WRKGRAB join("\t",$GRID_WRKDIR, $HOST, $$, 'start: '.getTime())."\n";
+ close(WRKGRAB);
+ $ENV{GRID_WORKER}=$GRID_WORKER;
+ if ($SwitchDir) {
+     chdir($starting_dir) || die "Error at chdir($starting_dir)!\n";
+    }
+  elsif ($GRID_LOCAL_JOBDIR) {
+     chdir($GRID_LOCAL_JOBDIR/$GRID_WRKDIR) || die "Error at chdir($starting_dir)!\n";
+     }
+ }
+
+sub endWorker {
+ return -1 unless $GRID_WORKER && $GRID_WRKDIR; 
+ #make sure we are back in the wrk_<GRID_WORKER> directory
+ unless (chdir("$GRID_JOBDIR/$GRID_WRKDIR")) {
+   die("ERROR: endWorker() could not change to $GRID_JOBDIR/$GRID_WRKDIR\n");
+   }
+  
+ my $fh=setXLock($F_WRKCOUNT,70, 3)  || die "Error updating the number of running workers!\n";
+ #  my $v=readFile($fh,0,$F_WRKCOUNT);chomp($v);
+ my $v=incFValue($fh, $F_WRKCOUNT, -1);
+ unlink($F_WRKRUNNING); #remove the "worker here" semaphore..
+ if ($v<0) {
+     endXLock($fh);
+     die("Error: invalid number of workers ($v) reported in $GRID_JOBDIR/$F_WRKCOUNT\n")
+     }
+ endXLock($fh);
+ print STDERR join("\t","D. worker $GRID_WRKDIR", $HOST, $$, 'finished at:',getTime())."\n" if $GRID_DEBUG;
+
+ local *WRKGRAB;
+ sysopen(WRKGRAB, ".on_$HOST", O_RDWR | O_SYNC );
+ sysseek(WRKGRAB,-1,SEEK_END);
+ print WRKGRAB "\tend: ".getTime()."\n";
+ close(WRKGRAB);
+ if ($GRID_LOCAL_JOBDIR) {
+   my $r=system("cp -pr $GRID_LOCAL_JOBDIR/$GRID_WRKDIR/* $GRID_JOBDIR/$GRID_WRKDIR/");
+   if ($r) {
+     print STDERR "Error at copying $HOST local files back to $GRID_JOBDIR/$GRID_WRKDIR!\n";
+     }
+   system("/bin/rm -rf $GRID_LOCAL_JOBDIR/$GRID_WRKDIR");
+   rmdir($GRID_LOCAL_JOBDIR); #it'll fail if there are other subdirs there, but that's OK
+   }
+ undef($GRID_WORKER);
+ undef($GRID_WRKDIR);
+ return $v; #returns the number of workers left running
+}
+
+sub writeFValue {
+ my ($fh, $v)=@_;
+ truncate($fh, 0);
+ seek($fh,0,SEEK_SET); 
+ $v=int($v);
+ print $fh $v."\n"; 
+ return $v;
+ }
+
+sub writeFList { #with truncate
+ my ($fh, $listref, $delim)=@_;
+ $delim='' unless $delim;
+ seek($fh,0,SEEK_SET); 
+ truncate($fh,0);
+ print $fh join($delim,@$listref);
+ #truncate($fh, tell($fh));
+ } 
+#
+# incFValue(fhandle) => reads an int value from fhandle 
+#                       increments it, writes it back
+#                       and returns it
+#
+sub incFValue {
+ my ($fh, $finfo, $incv)=@_;
+ seek($fh, 0, SEEK_SET);
+ $incv=1 unless $incv;
+ my $v=readFile($fh, 0, "incFValue(,,$incv) in $finfo");
+ chomp($v);
+ return writeFValue($fh, int($v)+$incv);
+}
+
+
+#******************** worker side:
+#  getNextTask() -- returns a taskId for the next task to be processed
+#                 or 0 if no more
+# -ignore any entries which are already "done"
+# -look first into the "retry pool" ($F_RETRYTASKS) to get some tasks from there, 
+#  if any -- and removes that entry
+#--------------- resources used:
+#  update $F_RETRYTASKS
+#  update $F_LASTTASK
+#  update ENV{GRID_TASK} and $GRID_TASK
+#  
+sub getNextTask {
+ #check for any tasks in the "retry" queue
+ my ($taskID, $retries);
+ my $sourcemsg;
+ SKIP_DONE:
+ $retries=0;
+ if (-s "$GRID_JOBDIR/$F_RETRYTASKS") {
+   my $hr=setXLock($F_RETRYTASKS,120,5) 
+       || wrkDie("Error locking $F_RETRYTASKS ($HOST, $GRID_WORKER)");
+   my @errstack=readFile($hr,0,$F_RETRYTASKS); #format:   taskid <space> #retries
+   ($taskID, $retries)=split(/\s+/, shift(@errstack)); #fetch last
+   if ($taskID>0) { #valid taskID to retry
+     chomp($retries);
+     writeFList($hr, \@errstack); #write the list back
+     $sourcemsg=' from the retry pool.';
+     }
+   endXLock($hr);
+   }
+ NEXT_TASK:
+ unless ($taskID) { #getting the next available task
+  #no retry tasks, so get the next task not processed yet
+  my $fh=setXLock($F_LASTTASK, 70, 3) ||
+     wrkDie("Error locking $F_LASTTASK ($HOST, $GRID_WORKER)"); #30 /retries
+   my $last=readFile($fh, 0, $F_LASTTASK);chomp($last);
+   if ($last<$GRID_TASKLAST) { # valid one, take the next
+      $taskID=writeFValue($fh,int($last)+1);
+      }
+  $sourcemsg='';
+  endXLock($fh);
+  }
+ return undef unless $taskID;
+ $GRID_TASK=$taskID;
+ # lock this taskID
+ $TASK_LOCKF="$GRID_JOBDIR/running/task_$taskID";
+ #$TASK_LOCKF="running/task_$taskID";
+ catchSigs(1); #install signal handler
+ $TASK_LOCKH=setXLock($TASK_LOCKF, 70, 3);
+ unless ($TASK_LOCKH) { #this SHOULD be available immediately.. 
+     my $lockedby=`cat $TASK_LOCKF`;chomp($lockedby);
+     print STDERR "WARNING: lock-fail on task $taskID $sourcemsg (previously locked in $TASK_LOCKF by [$lockedby])\n";
+     #wrkDie("Error: couldn't get a lock on task $taskID..\n");
+     undef($taskID);
+     goto SKIP_DONE; # don't kill the worker, just move on
+     }
+ print $TASK_LOCKH "$HOST $$ ".sprintf("wrk_%04d",$GRID_WORKER)."\n";
+ # check the status of this task:
+ my ($tstatus, $tuserdata, $tdirno, $thost, $terrcount, 
+     $texcode, $tstartmin)=taskDbStat("$GRID_JOBDIR/$F_TASKDB.cidx", $taskID);
+ print STDERR ">task-$taskID assigned to worker $GRID_WORKER (on $HOST) $sourcemsg\n";
+ if ($GRID_RESUME && $tstatus eq '.') {
+   #skip this one, it's finished (according to taskDb!)
+   print STDERR ">SKIP-done:$taskID \{$tstatus|$terrcount|$texcode|$tdirno|$tstartmin\}\t\{$thost\}\n";
+   undef $taskID;
+   undef $GRID_TASK;
+   endXLock($TASK_LOCKH);
+   catchSigs(0);
+   unlink($TASK_LOCKF);
+   undef($TASK_LOCKH);undef($TASK_LOCKF);
+   goto SKIP_DONE;
+   }
+ #update status of this task to 'running'
+ $TASK_ERRCOUNT=$retries;
+ taskDbStat("$GRID_JOBDIR/$F_TASKDB.cidx", $taskID, 'r', $GRID_WORKER, $HOST, $TASK_ERRCOUNT);
+ #--
+ $GRID_TASK=$taskID;
+ $TASK_DATA=$tuserdata;
+ $ENV{'GRID_TASK'}=$taskID;
+ $STARTED_GRID_TASK=$taskID;
+ return $taskID;
+}
+
+##############################################
+# runTask($taskID, @cmd)
+#------------------------
+# *runs into a ./wrk_NNNN subdirectory of GRID_JOBDIR
+# *employs $GRID_TASK, $TASK_DATA, $TASK_ERRCOUNT
+# *with GRID_PSXFASTA, it uses TASK_DATA and other GRID_PSX.. 
+#  to prepare the fasta slice and pass it to the cmd
+# *on exit, it should:
+#   - set a lock on the ../running/task_$taskID file
+#   - IF error exit of cmd (non-zero exit status), use $TASK_ERRCOUNT+1 and $MAX_RETRIES
+#     to determine if the job should be put in the $F_RETRYTASKS file 
+#     or if status should be set to 'E' in taskDb and the entry added
+#        to $F_ERRTASKS
+#   - IF successful exit : increment $F_TASKSDONE
+#   - update taskDb with the current status 
+#   - remove the lock on ../running/task_$taskID and delete this file!
+#     
+#---------------------------------------------
+sub runTask {
+ my $taskID=shift(@_);
+ my @cmd=@_;
+ my $exitstatus;
+ my $runcmd; #the actuall command run using system();
+ 
+ catchSigs(1); #install signal handler (should have been done already in getNextTask())
+ if ($GRID_LOCAL_JOBDIR) {
+   wrkDie("Fatal: cannot chdir to local dir $GRID_LOCAL_JOBDIR/$GRID_WRKDIR!")
+      unless chdir("$GRID_LOCAL_JOBDIR/$GRID_WRKDIR");
+   }
+
+ #if ($SwitchDir) {
+   # we are currently in a wrk_* directory
+ #  chdir('../..'); #change to the original directory (where gridx was launched from)
+ #  }
+ if ($GRID_PSXFASTA) { #psx emulation
+   #prepare the fasta slice here
+   my $fslice=sprintf('%s.slice-%08d',getFName($GRID_PSXFASTA), $GRID_TASK);
+   #-- write the slicefile
+   local *FDB;
+   local *FSL;
+   open(FSL, '>'.$fslice)
+      || wrkDie("Cannot create fasta slice $fslice");
+   open(FDB, $GRID_PSXFASTA) || wrkDie("Cannot open fasta db $GRID_PSXFASTA");
+   seek(FDB, $TASK_DATA, SEEK_SET);
+   local $/="\n";
+   my $seqnext=$GRID_PSXSTEP*($GRID_TASK-1); #+GRID_PSXSKIP
+   my $seqcount=0;
+   my $seqmax=($GRID_PSXTOTAL<=0) ? 0 : $GRID_PSXTOTAL;
+   while (<FDB>) {
+     if (/^>/) { #record start
+       $seqnext++;
+       last if ($seqcount>=$GRID_PSXSTEP);
+       last if $seqmax && ($seqnext>$seqmax);
+       $seqcount++;
+       }
+     print FSL $_;
+     }#while input line from fastadb
+   close(FSL);
+   close(FDB);
+   
+   $runcmd=shift(@cmd);
+   $GRID_PSXSKIP=0 unless ($GRID_PSXSKIP);
+   $GRID_PSXTOTAL=-1 unless ($GRID_PSXTOTAL>0);
+   my $islast=($GRID_TASK==$GRID_TASKLAST) ? 1 : 0;
+   #                             1           2                       3                  4
+   $runcmd.=' '.join(' ',$fslice, $seqcount, $GRID_TASK, $islast,
+   #                               5                             6                     7
+                                $GRID_PSXSKIP, $GRID_PSXTOTAL, @cmd);
+   
+   }
+  elsif ($GRID_USECMDLIST) {
+   # $TASK_DATA is the actual command to run
+   $runcmd=$TASK_DATA;
+   }
+  else { #normal repeat cmd -- let the cmd use the ENV accordingly
+   $runcmd=join(" ",@cmd);
+   }
+ 
+ #... get $exitstatus for the system() call
+ print STDERR ">starting-task-$GRID_TASK by worker $GRID_WORKER (on $HOST): '$runcmd'\n" if $GRID_DEBUG;
+ $exitstatus=system($runcmd);
+ if ($SwitchDir) {
+   chdir("$GRID_JOBDIR/$GRID_WRKDIR");
+   }
+ endTask($exitstatus); #taskID is taken from $GRID_TASK
+}
+
+
+sub catchSigs { # true/false
+ if ($_[0]) {
+  $SIG{INT}=\&sigHandler;
+  $SIG{TERM}=\&sigHandler;
+  }
+ else {
+  $SIG{INT}='DEFAULT';
+  $SIG{TERM}='DEFAULT';
+  }
+}
+
+sub sigHandler {
+ my $signame=shift;
+ wrkDie("Signal $signame caught for worker $$ on $HOST, aborting..\n");
+ }
+
+sub toRetry {
+ my ($taskID, $taskErrCount)=@_;
+ return unless $taskID;
+ $taskErrCount=1 unless $taskErrCount;
+ my $hr=setXLock($F_RETRYTASKS, 70, 3);
+ while (<$hr>) {
+   chomp;
+   my ($tid, $tec)=split(/\s+/);
+   if ($tid==$taskID) { #double retry, don't bother
+     endXLock($hr);
+     return;
+     }
+   }
+ fappend($hr, "$taskID\t$taskErrCount\n");
+ endXLock($hr);
+}
+
+sub endTask {
+ return unless $GRID_TASK;
+ # we MUST be in GRID_WRKDIR
+ chdir("$GRID_JOBDIR/$GRID_WRKDIR") || die("Error: failed to chdir to $GRID_JOBDIR/$GRID_WRKDIR!");
+ my ($exitstatus)=@_;
+ 
+ if (!$exitstatus && !$STARTED_GRID_TASK) { # could be a premature failure, like cdbyank not found, etc.
+   print STDERR "scheduling $GRID_TASK for retry..\n";
+   toRetry($GRID_TASK, $TASK_ERRCOUNT);
+   endXLock($TASK_LOCKH) if $TASK_LOCKH;
+   unlink($TASK_LOCKF);
+   undef($TASK_LOCKH);undef($TASK_LOCKF);
+   unlink($F_WRKRUNNING);
+   catchSigs(0);
+   undef $GRID_TASK;
+   return;
+   }
+ my $dbstatus;
+ if (defined($exitstatus)) {
+   if ($exitstatus==0) { #success
+     $dbstatus='.';
+     # update $F_TASKSDONE
+     my $fh=setXLock($F_TASKSDONE, 110, 5);
+     if ($fh) {
+        incFValue($fh, $F_TASKSDONE);
+        endXLock($fh);
+        }
+    }
+  else { #error status 
+     $TASK_ERRCOUNT++;
+     print STDERR "task $GRID_TASK failed on $HOST (PID=$$, status='$exitstatus') (worker $GRID_WORKER); error count=$TASK_ERRCOUNT\n" if $GRID_DEBUG;
+     if ($TASK_ERRCOUNT>$MAX_RETRIES) { #trash it
+          my $he=setXLock($F_ERRTASKS, 70, 3);
+          fappend($he, join("\t",$GRID_TASK,$exitstatus,$HOST,$GRID_WRKDIR)."\n");
+          endXLock($he);
+          $dbstatus='E';
+          }
+         else {#give it another retry chance
+          toRetry($GRID_TASK, $TASK_ERRCOUNT);
+          $dbstatus='-';
+          }
+    }
+  endXLock($TASK_LOCKH) if $TASK_LOCKH;
+  unlink($TASK_LOCKF) if $TASK_LOCKF;
+  undef($TASK_LOCKH);undef($TASK_LOCKF);
+  print STDERR "]task $GRID_TASK ended - updating taskDb with status code '$dbstatus'\n" if $GRID_DEBUG;
+  taskDbStat("$GRID_JOBDIR/$F_TASKDB.cidx", $GRID_TASK, $dbstatus,
+               $GRID_WORKER, $HOST, $TASK_ERRCOUNT, $exitstatus);  
+ } # defined $exitstatus
+else { #no exitstatus given, it was an interrupt signal or otherwise failed task
+ print STDERR "task $GRID_TASK ended with undefined exit status\n" if $GRID_DEBUG;
+ toRetry($GRID_TASK, $TASK_ERRCOUNT);
+ endXLock($TASK_LOCKH) if $TASK_LOCKH;
+ unlink($TASK_LOCKF) if $TASK_LOCKF;
+ undef($TASK_LOCKH);undef($TASK_LOCKF);
+ unlink($F_WRKRUNNING);
+ }
+catchSigs(0);
+undef($STARTED_GRID_TASK);
+}
+
+sub wrkDie {
+ my ($msg)=@_;
+ endTask();
+ my $grdwrk=$GRID_WORKER;
+ endWorker();
+ #remove any other locks left in this worker..
+ die("Error at worker $grdwrk on $HOST:\n$msg\n");
+}
+
+#--onExit, onEnd trigger
+sub END {
+ unless ($NORMAL_ENDING) {
+ $NORMAL_ENDING=1; #to avoid recursion?
+ endTask();
+ endWorker();
+ #remove all locks
+ my @locks=keys(%Locks); 
+ foreach my $lock (@locks) {
+  my $d=$Locks{$lock};
+  endXLock($lock);
+  }
+ }
+}
+
+sub fappend { 
+ my $fh=shift(@_);
+ seek($fh,0,SEEK_END);
+ print $fh join("\n",@_); 
+ }
+
+sub prepLock {
+ #this is called by a node just before a file lock is requested
+ #returns ($lock_file, $rand_linkname)
+ my ($fname)=@_; #MUST be a path relative to GRID_JOBDIR
+ if (index($fname,$GRID_JOBDIR.'/')==0) {
+   #remove the full path, if there
+   $fname=substr($fname, length($GRID_JOBDIR)+1);
+   }
+ my $fnlock=$fname;
+ $fnlock=~tr/\/\\/--/s;
+ $fnlock.='.gxlock';
+ # generate a unique lock file name
+ my $nodelockf="$GRID_LOCKDIR/$fnlock.$HOST.$$";
+ #--
+ $nodelockf.='.'.substr(time(),-5).'-'.int(rand(999999));
+ return ($GRID_LOCKDIR.'/'.$fnlock, $nodelockf);
+}
+
+sub touchLockFile {
+ my ($nodelockf)=@_;
+ my $fh;
+ open($fh, '>'.$nodelockf) || die("Error creating lockfile $nodelockf!\n");
+ my $thismin=int(time()/60); # time when the lock was first initiated
+ print $fh "$HOST $$ $thismin $GRID_WORKER\n";
+ close($fh);
+}
+
+sub getLock {
+ #expects: ($lock_file, $rand_file) as returned by prepLock
+ #attempts to create a hard link $lock_file to $rand_file
+ my ($lock_file, $rand_file)=@_;
+ touchLockFile($rand_file);
+ chmod(0600, $rand_file) || die "Error: cannot chmod lock file $rand_file\n";
+ 
+ my $success = link($rand_file, $lock_file)
+       && -e $rand_file && (stat _)[3] == 2;
+ unlink $rand_file; #but if link succeeded or already existed, lock_file has *a* $rand_file content
+
+ return $success;
+  
+ #if (link($lockfile, $rand_lname)) { #could create link to node lock file
+ #  my @stat=stat($nodefile);
+ #  my $linkcount=$stat[3];
+ #  if ($linkcount>2) {
+ #    print STDERR "WARNING: wrong lnkcount=$linkcount ($GRID_WORKER, $HOST, task $GRID_TASK)!\n";
+ #    }
+ #  return ($linkcount>1); #should never be more than 2..
+ #  }
+ # else { #cannot create link
+ #  return undef;
+ #  }
+}
+
+#attempts to aquire an exclusive lock on a specific file
+#-returns a file handle ref
+sub setXLock {
+ my ($fname, $maxretries, $stalemin)=@_;
+ $maxretries=80 unless $maxretries;
+ #
+ # -- default: locks older than this are 
+ #    considered "stale" and removed!
+ $stalemin=7200 unless $stalemin;
+ my ($lockfile, $nodefile)=prepLock($fname);
+ my $retries=0;
+ my $startmin=int(time()/60); #the minute we started trying
+ #----------- try mkdir
+ my ($currentLocker, $lock_age, $prevlock, $haveLock);
+ 
+ while (!($haveLock=getLock($lockfile, $nodefile))) {
+   if ($retries>$maxretries) {
+      #tried too many times?
+      #check for stale lock forgotten here..
+      if (-e $lockfile) {
+        #anyone ELSE holding it?
+        my $l=readFile($lockfile);
+        my ($lhost, $lpid, $ltime, $worker)=split(/\s+/,$l);
+        $prevlock="$lhost (pid $lpid, worker $worker)" if $lpid;
+        # code to check for a stale lock:
+        $lock_age=int(time()/60)-$ltime;
+        if ($lock_age>$stalemin) { #previous lock is older than $stalemin minutes
+             print STDERR "WARNING: removing stale $fname lock from $lhost PID $lpid (worker $worker), age $lock_age minutes.\n";
+             unlink($lockfile);
+             next; # hopefully we'll get it next time, unless another node steals it..
+             }
+        }
+      print STDERR "WARNING: too many retries attempting to lock $lockfile!\n";
+      last; #too many retries;
+      }
+   $retries++;
+   sleep(3); #pause 3 seconds between attempts
+ } #----- while failing at getting a lock
+ if ($haveLock) {
+#    local *FH;
+#    open(FH, ">$nodefile") 
+#       || die "Error re-creating host lock file $nodefile ?! ($!)\n"; #should never happen, really
+#    my $thismin= int(time()/60);
+#    print FH "$HOST $$ $thismin $GRID_WORKER\n";
+#    close(FH);
+   # -- now it's safe to open the actual file being locked..
+   # has to be a path relative to $GRID_JOBDIR
+   $fname="$GRID_JOBDIR/$fname" unless $fname=~m/^[\/\\]/;
+   # --
+   # --  add O_DIRECT only if you notice syncing/flushing issues for small files
+   # --
+   #my $mode= O_RDWR | O_CREAT | O_SYNC | O_DIRECT;
+   #my $mode=(-f $fname) ? '+<' : '+>'; #create file if not there..
+   my $fh;
+   #open($fh, $mode.$fname) || die "setXLock($fname) failed at open($mode.$fname): $!\n";
+   sysopen($fh, $fname, $sysopen_mode) || die "setXLock($fname) failed at sysopen ($fname): ($!)\n";
+   $Locks{$fh}=[$lockfile, $nodefile];
+   return $fh;
+   }
+ else {
+   print STDERR "ERROR getting a lock on $fname ($lockfile -> $nodefile) after $retries attempts!\n";
+   print STDERR " (blocked by: $prevlock of $lock_age minutes)\n" if $prevlock;
+   unlink($nodefile);
+   return undef;
+   }
+}
+
+sub endXLock {
+ my $fh=shift(@_);
+ close($fh) || die("Error closing file handle at endXLock()\n");
+ my $d = delete($Locks{$fh});
+ unless ($d) {
+    print STDERR "WARNING at endXLock(): no Locks entry found for file handle $fh!\n";
+    return;
+    }
+ my ($locklink, $nodefile)=@$d;
+ unlink($locklink);
+}
+
+# readFile(fname/fglobref) : read first or all lines from a given file 
+# or filehandle glob reference
+sub readFile {
+ my ($f, $nonfatal, $context)=@_;
+ $context=" ($context)" if $context;
+ my ($fh, $open);
+ if (ref($f) eq 'GLOB') { # file handle or glob reference..
+   $fh=$f;
+   $f='[fh]';
+   }
+  else { #scalar: string = filename 
+   #create if not there!
+   my $mode=(-f $f) ? '+<' : '+>'; #create if not exists
+   my $canopen=open($fh, $mode.$f);
+   unless ($canopen) {
+     return undef if $nonfatal;
+     die "readFile($mode $f)$context task $GRID_TASK on $HOST, open error: $!\n";
+     }
+   $open=1;
+   }
+ local $/="\n";
+ if (wantarray()) {
+     my @r=<$fh>;
+     close($fh) if $open;
+     return @r;
+     }
+   else { #first line only
+     my $line=<$fh> || '';
+     close($fh) if $open;
+     return $line;
+     }
+}
+
+#===================================================
+# Mailer subroutine
+#--- only works for some Linux installations.. as it requires sendmail
+sub send_mail {
+ my $hash=shift;
+ $hash->{'from'}=$USER.'@'.$HOSTNAME
+    unless defined($hash->{'from'});
+ my $to=$hash->{'to'};
+ unless ($to) {
+    $hash->{'to'}=$USER.'@'.$DOMAIN;
+    }
+   else {
+    $hash->{'to'}=$to.'@'.$DOMAIN unless $to =~ m/@/;
+    }
+    
+ my $file;
+ local *ADDFILE;
+ if (defined($hash->{file})) {
+   #warning: assumes it's a decent, short text file!
+   local $/=undef; #read whole file
+   open(ADDFILE, '<'.$hash->{file}) || return "Cannot open file ".$hash->{file}."\n";
+   $file=<ADDFILE>;
+   close ADDFILE;
+   }
+ my $body = $hash->{'body'};
+ $body.=$file;
+ #my $fh;
+ local* FH;
+ open(FH, '| /usr/lib/sendmail -t -oi') || die "Error: cannot open sendmail pipe!\n";
+ print(FH "To: $hash->{to}\n");
+ print(FH "From: $hash->{from}\n");
+ print(FH "Subject: $hash->{subj}\n\n");
+ print(FH $body);
+ close(FH);
+}
+
+sub getTime {
+ my $date=localtime();
+ #get rid of the day so Sybase will accept it
+ (my $wday,$date)=split(/\s+/,$date,2);
+ return $date;
+}

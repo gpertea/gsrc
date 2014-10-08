@@ -1,0 +1,429 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+use FindBin;use lib $FindBin::Bin;
+
+my $usage = q/Usage:
+ tbl2gff [-F] [-g <chr_table>] [-t <track>] -p <prot2nuc.tab> <ncbi_tbl_file> 
+
+ Convert the given NCBI tbl file to GFF3
+ 
+ Options:
+ -p  protein_id to transcript_id mapping file (required)
+     this file has 2 columns: 
+        GenPept accession and (nucleotide) accession 
+     it is required in order to assign CDS to their 
+     corresponding mRNA exons
+ -t  use given track name instead of 'gb_tbl'
+ -g  replace the genomic sequence names according
+     to the translation table <chr_table>
+     (only the first 2 columns in that file are used)
+ -M  only outputs mRNA entries (without gene lines)
+ -F  preserve all notes and comments
+/;
+umask 0002;
+my %kattrs;
+#key attributes to always keep 
+@kattrs{'gene', 'product', 'transcript_id'}=();
+getopts('FMt:g:p:') || die($usage."\n");
+my $gxfile=$Getopt::Std::opt_g;
+my $p2nfile=$Getopt::Std::opt_p;
+my $mrnaonly=$Getopt::Std::opt_M;
+die("Error: -p is required -- to map protein_id to transcript_id\n") unless $p2nfile && -f $p2nfile;
+my %pmap; # protein_id => transcript_id
+open(PROTMAP, $p2nfile) || die("Error opening $p2nfile!\n");
+while (<PROTMAP>) {
+ chomp;
+ my ($p, $n)=split;
+ next unless $n;
+ $p=~s/\.\d+$//;
+ $n=~s/\.\d+$//; # discard versioning
+ $pmap{$p}=$n;
+}
+close(PROTMAP);
+
+my $track=$Getopt::Std::opt_t || 'gb_tbl';
+my $allattrs=$Getopt::Std::opt_F;
+my $last_line;
+my %gx; # translation table for genomic sequence names ('>Feature' line)
+if ($gxfile) {
+ open(GX, $gxfile) || die("Error opening $gxfile\n");
+ while(<GX>) {
+  chomp;
+  my @t=split;
+  if ($t[0] && $t[1]) {
+   $gx{$t[0]}=$t[1];
+   $gx{$t[1]}=$t[0];
+   }
+  }
+ close(GX); 
+}
+
+my $tblfile=$ARGV[0];
+die($usage."\n") if $tblfile eq '-h' || ! -f $tblfile;
+
+my %gids; #ensure unique gene IDs
+          #allow for duplication $gids{$gene}=[ [gstart1, gend1], [gstart2, gend2] ]
+my %tids; # and transcript IDs
+
+# -- per gbase: 
+
+my %genes; # genes{$gene}=[$gbase, $strand, $gstart, $gend, [@gxrefs], \%gattrs,  \%rnas,  isPseudo]
+           #                  0        1        2      3        4         5          6        7
+#my %rnas;
+# %rnas hash holds all mRNA data for a single gene (i.e. all isoforms)
+#                             0         1      2         3        4          5         6
+# $rnas{transcript_id}=[ $featname, [@exon], [@cds], \%tattrs, [@txrefs], $partial3, $partial5 ]
+#current values:
+my ($gbase, $curfeat, @exon, %cattrs, $gpseudo,  $gstart, $gend, $partial5, $partial3);
+my $strand='+';
+
+# product and transcript_id are found in %tattrs
+while (<>) {
+ $last_line=$_;
+ if (m/^>Feature\s+(\S+)/) { # misnomer - in fact this is the genomic sequence name
+   my $newbase=$1;
+   flushGSeq(); #write previous gene feature
+   $gbase='';
+   if ($gxfile) {
+     $gbase=$gx{$newbase};
+     unless ($gbase) {
+       if ($newbase=~m/^[a-z]+\|([\w\.]+)/) {
+          $newbase=$1;
+          $gbase=$gx{$newbase};
+          unless ($gbase) {
+            $newbase=~s/\.\d+$//;
+            $gbase=$gx{$newbase};
+            }
+          }
+       }
+     } #convert contig name
+   $gbase=$newbase unless $gbase;
+   next;
+   } # base genomic sequence (contig/chromosome) established
+ chomp;
+ tr/\n\r//d;
+ my @t=split(/\t/);
+ my ($start, $end)=@t[0,1];
+ if ($start && $end) { # segment coordinates
+   $partial5=1 if ($start=~s/^<//);
+   $partial3=1 if ($end=~s/^>//);
+   my $newstrand='+';
+   if ($end<$start) {
+     $newstrand='-';
+     ($start, $end)=($end, $start);
+     }
+   if ($t[2]) { # feature start (gene/mRNA/CDS)
+     flushFeature() unless $t[2] eq 'exon'; #cleanup current gene/transcript data
+     $strand=$newstrand;
+     if ($t[2] eq 'gene') {
+       #new gene feature starts
+       $curfeat='gene';
+       $gstart=$start;
+       $gend=$end;
+       } # gene start
+     else { #non-gene features starting
+       if ($t[2] eq 'exon') { # special case, exons given one by one
+         if ($curfeat ne 'RNA_exon') { #first exon
+           flushFeature(); #just in case there was another mRNA (exons) given before
+           }
+         $curfeat='RNA_exon';
+         push(@exon, [$start, $end]);
+         }
+        elsif ($t[2] eq 'CDS' || $t[2]=~m/RNA/) {
+         $curfeat=$t[2];
+         push(@exon, [$start, $end]);
+         }
+        else { $curfeat=''; next; } 
+      # -- skipping any other features here
+      } #non-gene features starting
+     } # feature start 
+    else { # feature continuation
+     $strand=$newstrand;
+     if ($curfeat eq 'CDS' || $curfeat=~/RNA/) {
+        push(@exon, [$start, $end]);
+        }
+       else {
+        die("Error: unexpected feature '$curfeat' continuation\n$last_line");
+        }
+     }
+   } # had segment coordinates
+  else { # no segment coords => attributes for current feature
+   my ($attr, $value)=@t[3,4];
+   $value=~tr/;/,/;
+   if ($attr eq 'db_xref' || $attr eq 'gene_syn') {
+      push(@{$cattrs{$attr}}, $value);
+      }
+     else { 
+      $cattrs{$attr}=$value if $attr ne 'number';
+      }
+   } # attributes block
+ } #while input lines
+
+ flushGSeq();
+
+#================ SUBROUTINES ============
+
+sub writeGene {
+ my ($gene, $gdata)=@_;
+ my $geneid=$gene;
+ my ($gene_name)=($geneid=~m/^([^~]+)/);
+ $geneid=~tr/~/_/;
+ ($gbase,       $strand,      $gstart,     $gend,      $gpseudo)=
+  ($gdata->[0], $gdata->[1], $gdata->[2], $gdata->[3], $gdata->[7]);
+ my $gfeature=($gpseudo)?'pseudogene' : 'gene';
+ #makeUniqID(\$gene, \%gids); # $gene will be updated if necessary
+ #my $geneid=$gene;
+ #$geneid=~tr/~/_/;
+ my $attrs="ID=$geneid;Name=$gene_name";
+ my @gxrefs=@{$gdata->[4]};
+ $attrs.=';xrefs='.join(',', @gxrefs) if (@gxrefs>0);
+ my $gattrs=$gdata->[5];
+ unless ($mrnaonly) {
+   foreach my $k (keys(%$gattrs)) {
+       $attrs.=";$k=".$gattrs->{$k};
+       }
+   print join("\t", $gbase, $track, $gfeature, $gstart, $gend, '.', $strand, '.', $attrs)."\n";
+   }
+ 
+ my $rnas=$gdata->[6];
+ foreach my $tid (keys(%$rnas)) {
+    #die("Error: no transcript_id found at write_RNA for gene $gene ($geneid)\n$last_line\n") unless $tid;
+    my $tdata=$rnas->{$tid};
+    my $rnafeat=$tdata->[0];
+    if ($rnafeat eq 'RNA_exon') {
+       $rnafeat = $gpseudo ? 'pseudo_RNA' : 'misc_RNA';
+       }
+    if ($mrnaonly) {
+      $rnafeat=~s/misc_RNA/mRNA/;
+      }
+      
+    next if $mrnaonly && $rnafeat ne 'mRNA';
+    my $texons=$tdata->[1];
+    my $tcds=$tdata->[2];
+    my $tahref=$tdata->[3]; #attributes
+    my $txar=$tdata->[4]; # db_xrefs
+    my ($part3, $part5)=($tdata->[5], $tdata->[6]);
+    makeUniqID(\$tid, \%tids);
+    @exon=sort { $main::a->[0] <=> $main::b->[0] } @$texons;
+    my ($tstart, $tend)=($exon[0]->[0], $exon[-1]->[1]);
+    my $attrs="ID=$tid";
+    $attrs.=";Parent=$geneid" unless $mrnaonly;
+    $attrs.="Name=$gene_name;gene_name=$gene_name";
+    $attrs.=';partial=1' if ($part5 || $part3);
+    my $product=$tahref->{'product'};
+    if ($product) {
+      $product=~tr/"/'/; #"
+      $attrs.=';product="'.$product.'"';
+      }
+    if ($allattrs) {
+      $attrs.=';xrefs='.join(',', @$txar) if (@$txar > 0);
+      foreach my $k (keys(%$tahref)) {
+        next if exists($kattrs{$k});
+        $attrs.=";$k=".$tahref->{$k};
+        }
+      }
+    print join("\t", $gbase, $track, $rnafeat, $tstart, $tend, '.', $strand, '.', $attrs)."\n";
+    foreach my $ex (@exon) {
+     print join("\t", $gbase, $track, 'exon', $$ex[0], $$ex[1], '.', $strand, '.', "Parent=$tid")."\n";
+     }
+    @exon=();
+    #write_CDS();
+    my @cds=@$tcds;    
+    if (@cds>0) { #have CDS, write it
+      @cds=sort { $main::a->[0] <=> $main::b->[0] } @cds;
+      my $codonstart=$tahref->{'codon_start'};
+      if ($codonstart>1) {
+        $codonstart--;
+        if ($strand eq '-') {
+          $cds[-1]->[1]-=$codonstart;
+          }
+         else {
+          $cds[0]->[0]+=$codonstart;
+          }
+        }
+       else { $codonstart='0'; }
+
+      foreach my $cd (@cds) { #TODO: calculate phase ?
+        print join("\t", $gbase, $track, 'CDS', $$cd[0], $$cd[1], '.', $strand, '.', "Parent=$tid")."\n";        
+        }
+      }
+  } #for each transcript
+}
+
+sub makeUniqID {
+ my ($idref, $href)=@_;
+ my $id=$$idref;
+ $id=~s/~\d+$//;
+ my $c = ++$$href{$id};
+ if ($c>1) {
+   $c--;
+   $$idref=$id.'.m'.$c;
+   }
+ return $$idref;  
+}
+
+sub flushFeature { #called after an attribute block has been parsed into %cattrs
+ return unless $curfeat && keys(%cattrs)>0;
+ my $gene=$cattrs{'gene'};
+ die("Error: no gene attribute found for current feature $curfeat\n") 
+    unless $gene;
+ if ($curfeat eq 'gene') { # gene attributes processing
+   #make sure it's unique
+   push(@{$gids{$gene}},[$gbase, $gstart, $gend]);
+   my $gno=scalar(@{$gids{$gene}})-1;
+   $gene.='~'.$gno if $gno>0;
+   if (exists($genes{$gene})) { #should never happen, we just made sure it's unique!
+         my $prev_gstart=$genes{$gene}->[2];
+         my $prev_gend=$genes{$gene}->[3];
+        # if (abs($prev_gstart-$gstart)>30000) {
+           die("Error -- gene $gene is duplicated ($prev_gstart vs $gstart) !?\n");
+        #   }
+        # else { #update min..max coordinates
+        #   $genes{$gene}->[2]=$gstart if $gstart<$prev_gstart;
+        #   $genes{$gene}->[3]=$gend if $gend>$prev_gend;
+        #   ${$genes{$gene}->[5]}{'fragmented'}=1;
+        #   }
+        }
+      else 
+      { # create a new gene entry here
+       my $pseudo= delete($cattrs{'pseudo'}) ? 1 : 0;
+       #                 0       1         2       3    4    5  6      7 
+       $genes{$gene}=[$gbase, $strand, $gstart, $gend, [],  {}, {}, $pseudo];
+       }
+   delete $cattrs{'gene'};
+   if ($allattrs) {
+     if (exists($cattrs{'db_xref'})) {
+        $genes{$gene}->[4]=[@{$cattrs{'db_xref'}}];
+        delete $cattrs{'db_xref'};
+        }
+    #another special case: gene_syn
+     if (exists($cattrs{'gene_syn'})) {
+        #convert [list] to a string with comma delimited names
+        $cattrs{'gene_syn'}=join(',',@{$cattrs{'gene_syn'}});
+        }
+    my $garef=$genes{$gene}->[5];
+    my @k=keys(%cattrs);
+    @{$garef}{@k}=(values(%cattrs));
+    } #all attributes are kept
+   @exon=();
+   %cattrs=(); 
+   ($partial3, $partial5)=();
+   return; #gene data added
+   } # stored gene attributes
+# else 
+# - storing RNA attributes
+# now make sure we place this RNA within the right gene - in case of gene duplications
+# locate the matching $gene
+@exon= sort { $main::a->[0] <=> $main::b->[0] } @exon;
+my ($xstart, $xend)=($exon[0]->[0], $exon[-1]->[1]);
+my $gxdata=$gids{$gene};
+die("Error: gene $gene not found in \%gids !\n") unless $gxdata; #should never happen
+if (@$gxdata>1) {
+  my $i=0;
+  my $found;
+  foreach my $gd (@$gxdata) {
+    if ($gd->[0] eq $gbase && $gd->[1]<=$xstart && $gd->[2]>=$xend) {
+      $found=1;
+      last;
+      }
+    $i++;
+    }
+  die("Error: cannot find gene enclosing RNA data ".
+      $cattrs{'transcript_id'}." ".$cattrs{'protein_id'}." (on $gbase, $xstart..$xend)\n")
+       unless $found;
+  $gene.='~'.$i if $i>0; 
+  }
+
+my $geneid=$gene;
+my $gdata=$genes{$gene};
+die("Error: \$genes data for gene '$gene' cannot be found!\n") unless $gdata;
+my $rnas=$gdata->[6];
+$geneid=~tr/~/_/;
+my ($tid, $pid);
+if ($curfeat eq 'CDS') { # just finished a CDS parsing
+  my $pid=$cattrs{'protein_id'};
+  die("Error: no protein_id found for CDS feature (gene $geneid)!\n") unless $pid;
+  #$pid=~s/^[a-z]+\|//i; # ref|NM_002314.1|
+  #$pid=~s/\|(\w*)$//; # some entries have a suffix - e.g. ref|NM_006824.1|P40
+  my @t=split(/\|/,$pid);
+  $pid=$t[1] if (@t>1);
+  $pid=~s/\.\d+$//; #remove version
+  $tid=$pmap{$pid}; 
+  die("Error: cannot get transcript for protein id $pid (gene $geneid)!\n") unless $tid;
+  unless (exists($rnas->{$tid})) { #this should never happen - CDS without mRNA definition?
+    #               0         1       2     3   4   5  6
+    #$rnas->{$tid}=['mRNA', [@exons], [@cds], {}, [], 0, 0];
+    $tid=~s/\.\d+$//;
+    die("Error: cannot find mRNA entry for protein $pid (reported as coming from transcript $tid)\n")
+       unless exists($rnas->{$tid});
+    }
+   # #just add the CDS
+   push(@{$rnas->{$tid}->[2]}, @exon);
+   #   }
+  } #CDS
+ else { # exons (RNA feature)
+ $tid=$cattrs{'transcript_id'};
+ if ($tid) {
+    my @t=split(/\|/,$tid);
+    $tid=$t[1] if (@t>1);
+    #$tid=~s/^[a-z]+\|//i;
+    #$tid=~s/\|\w*$//; # some entries have a suffix - e.g. ref|NM_006824.1|P40
+    $tid=~s/\.\d+$//; #remove version!
+    }
+   else {
+    $tid=$geneid.'_t'; #some special cases with 'exon' features for pseudo genes
+    }
+  unless (exists($rnas->{$tid})) {
+    #               0         1      2   3   4   5  6
+    $rnas->{$tid}=[$curfeat, [@exon], [], {}, [], 0, 0];
+    }
+   else { #just add the exons
+    push(@{$rnas->{$tid}->[1]}, @exon);
+    }
+  } #exons
+my $tdata=$rnas->{$tid};
+$tdata->[5]=1 if $partial5;
+$tdata->[6]=1 if $partial3;
+# add attributes
+delete @cattrs{'gene', 'transcript_id', 'protein_id'};
+my $product = delete $cattrs{'product'};
+my $ahref=$tdata->[3];
+$ahref->{'product'}=$product if $product;
+if ($allattrs) {
+ my %xrefs;
+ my @cx;
+ @cx=@{$cattrs{'db_xref'}} if exists $cattrs{'db_xref'};
+ push(@cx, @{$tdata->[4]});
+ @xrefs{@cx}=();
+ @cx=keys(%xrefs);
+ $tdata->[4]=[@cx];
+ delete $cattrs{'db_xref'};
+ #add new attributes 
+ foreach my $k (keys %cattrs) {
+   $ahref->{$k}=$cattrs{$k};
+   }
+ }  
+#--> clean up
+@exon=();
+%cattrs=();
+($partial3, $partial5)=();
+}
+
+sub flushGSeq {
+ return unless keys(%genes);
+ flushFeature(); # write last RNA feature read
+ my $gcount=keys(%genes);
+ while (my ($g,$gd)=each(%genes)) {
+    writeGene($g,$gd);
+ }
+ ($gbase, $curfeat, @exon, %cattrs, $gpseudo,  $gstart, $gend, 
+  $partial5, $partial3)=(); 
+ $strand='+';
+ @exon=();
+ %cattrs=();
+ %genes=();
+ #-- debug only:
+ #exit;
+}
+

@@ -1,0 +1,34 @@
+#!/bin/sh
+if [[ -d .svn && ! -d .svn-igm && ! -d .svn-bio ]]; then
+  mv .svn .svn-igm
+  ln -s .svn-igm .svn
+fi
+nolink=""
+if [[ -h .svn ]]; then 
+ if [[ -d .svn-bio ]]; then
+  /bin/rm .svn
+  ln -s .svn-bio .svn
+ fi
+else
+ #.svn is not a symbolic link, .svn-bio exists
+if [[ -d .svn-bio && ! -d .svn-igm ]]; then
+  mv .svn .svn-igm
+  ln -s .svn-bio .svn
+  nolink="1"
+ fi
+fi
+
+svn "$@"
+if [[ -h .svn ]]; then
+ /bin/rm -f .svn
+ if [[ "$nolink" ]]; then
+   mv .svn-igm .svn
+ else
+   ln -s .svn-igm .svn
+ fi
+fi
+
+
+
+
+

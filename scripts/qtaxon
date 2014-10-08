@@ -1,0 +1,212 @@
+#!/usr/bin/perl
+use strict;
+use FindBin;use lib $FindBin::Bin;
+use dbSession;
+use Getopt::Std;
+
+my $usage = q/Usage:
+ qtaxon [-q] [-p <#lvls>] [-b <db>[@<server>]] [-U [-x<maxpe>]] 
+        <taxon_id>|<organism-name>
+ 
+ Default operation (without any options) is to show a list of 
+ taxon records belonging to the whole taxonomic tree of the 
+ organism (class) query.
+
+ The organism class query can be given as either a numeric NCBI 
+ taxon ID or a scientific or "common" name for the organism\/class 
+ (which has to resolve into a NCBI taxon ID eventually). 
+ 
+ Options:
+  -b  : database\/server locator to override the default (which is the 
+        'common' database);  has the format <db>[@<server>][:<user>]
+  -q  : query only the first level (root) of the taxononmic tree(s) that 
+        can be found for the provided organism class(es) or taxon ID(s). 
+        This query mode also accepts a SQL pattern to be used for the 
+        <organism-name> string (e.g. 'Mus%') and it also accepts a 
+        comma delimited list of numeric taxon IDs
+  -p  : also shows parent nodes, going <#lvls> levels up from query taxon
+  -F  : do not format the display (default is to use indentation based on 
+        various levels in the (local) taxonomy tree shown)
+  -U  : returns a list of UniProt entries corresponding to the taxon IDs
+        queried (and its whole subtree unless -q is used). In conjunction
+        with the -q option the list of proteins is limited to only those 
+        belonging to the first level (root) of the taxa being queried. 
+  -x  : with -U option, only returns entries having a PE code 
+        lower or equal to <maxpe>
+/;
+
+umask 0002;
+
+getopts('qDUFb:x:p:o:') || die($usage."\n");
+
+my $outfile=$Getopt::Std::opt_o;
+my $debug=$Getopt::Std::opt_D;
+my $notree = $Getopt::Std::opt_q;
+my $maxpe = $Getopt::Std::opt_x;
+my $getprot = $Getopt::Std::opt_U;
+my $fmtout = !$Getopt::Std::opt_F;
+my $numparents = $Getopt::Std::opt_p;
+my $tdb = $Getopt::Std::opt_b || 'common';
+my @auth = &db_perm($tdb);
+
+
+die("$usage\nError: no query organism given!\n") unless @ARGV>=1;
+
+my @arg;
+
+foreach my $qstr (@ARGV) {
+ my @a=split(/\,/,$qstr);
+ push(@arg, @a);
+ }
+
+#print STDERR "auth: ".join(",",@auth)."\n";
+my $ds = dbSession->new(@auth);
+
+#my $ds = dbSession->new("$user"."@"."$mysqlhost");
+my %qdata; # list of main taxon IDs queried
+           # tax_id => [parent_id, name, c_name]
+           
+foreach my $qstr (@arg) {
+ print ">query:$qstr\n" if @arg>1 && !$getprot; 
+ my $numeric=($qstr=~/^\d+$/);
+ my $sth;
+ if ($numeric) {
+   ($sth, my $ret)=$ds->exec("select tax_id, parent_id, name, c_name from ".
+           "taxon where tax_id=$qstr");
+   }
+   else {
+   #string query (name or c_name)
+   my $qcname=lc($qstr);
+   my $qname=$qcname;
+   $qname=~s/^(\w)/\U$1/;
+   my $op = ($qstr=~m/\%/) ? 'like' : '=';
+   ($sth, my $ret)=$ds->exec("select tax_id, parent_id, name, c_name from ".
+             "taxon where name $op '$qname' or c_name $op '$qcname'");
+   }
+ while (my $r=sth_fetch($sth)) {
+  $qdata{$$r[0]}=[1, $$r[1], $$r[2], $$r[3]];
+  } #for each query taxon
+
+ $sth->finish();
+ 
+ my @pt=keys(%qdata); #parent trees to expand
+ foreach my $t (@pt) {
+    print STDERR "running sql_get_tree with $t..\n" if $debug;
+    my $qd=$qdata{$t};
+    
+    my $ar=&sql_get_tree($ds, $t, $qd, $numparents, $notree);
+    
+    # -- print the results here:
+    foreach my $r (@$ar) {
+      my @d=@$r;
+      my $depth=pop(@d);
+      unless ($getprot) {
+         print ' ' x $depth if $fmtout;
+         my $tpointer=($fmtout && ($d[0]==$t) && !$notree)?"\t<-":"";
+         print join("\t",@d)."$tpointer\n";
+         }
+      $qdata{$$r[0]}=[0,$$r[1], $$r[2], $$r[3]]
+            if (@$r>1 && !exists($qdata{$$r[0]}));
+      }#while rows
+  } #for each query taxon
+}
+
+exit(0) unless $getprot;
+
+# show corresponding uniref proteins
+my $pqry='select tax_id, up_id from uniprot where tax_id=?';
+$pqry.= ' and xcode<='.$maxpe if $maxpe;
+my $sth=$ds->prep($pqry);
+#my %uniref; #to collapse the results
+foreach my $t (keys(%qdata)) {
+ sth_exec($sth, $t);
+ while (my $r=sth_fetch($sth)) {
+   #$uniref{$$r[0]}=$t;
+   print $$r[0]."\t".$$r[1]."\n";
+   }
+ }
+$sth->finish(); 
+
+sub sql_get_tree {
+ my ($ds, $t, $td, $pnum, $notree)=@_;
+ my ($sth, @ar);
+ my $srvtype=$ds->servertype();
+ if ( $srvtype eq 'sybase') {
+   #our sybase, we have a stored procedure for this
+   my $rt;
+   ($sth, $rt)=$ds->exec("get_taxon_tree $t");
+   while ((my $r=$sth->fetch())) {
+     push(@ar, [@$r]);
+     }
+   $sth->finish();
+   return \@ar;
+   }
+  else { # elsif ($srvtype eq 'mysql') { #must be mysql
+
+   my $qt=$t;
+   if ($pnum>0) { # parents requested
+       $qt=nav2parent($$td[1], $pnum, \@ar);
+       }
+   # ---
+   # print STDERR "parent qt = $qt\n" if $debug;
+
+   my $sth=$ds->prepare('select tax_id, parent_id, name, c_name from taxon where parent_id=?');
+   my $rcount=0;
+   if ($notree) {     
+     @ar=reverse(@ar);
+     my $depth=scalar(@ar);
+     push(@ar, [$t, $$td[1], $$td[2], $$td[3], $depth]);
+     }
+   else { # tree required
+     if (@ar) { #parents requested earlier
+        my $ad=$ar[-1];
+        @ar=( $ad ); #keep only the first entry
+        }
+       else {
+        @ar = ( [$t, $$td[1], $$td[2], $$td[3], 0] );
+        }
+     get_taxchildren(\@ar, $sth, $qt, 0); #recursive call to populate the results array
+     }
+   $sth->finish();
+   return \@ar;
+   }
+}
+
+sub get_taxchildren {
+ my ($ar, $sth, $t, $depth)=@_;
+ sth_exec($sth, $t);
+ my @crs; # child data
+ my $accnt=scalar(@$ar);
+ # print STDERR " children list for $t (total count so far: $accnt)\n" if $debug;
+ $depth++;
+ while ((my $r=sth_fetch($sth))) { 
+   #push(@$ar, [@$r, $depth]);
+   #print STDERR "\t".join("\t", @$r)."\n" if $debug;
+   push(@crs, [@$r]);
+   }
+ foreach my $cr (@crs) {
+  push(@$ar, [@$cr, $depth]);
+  get_taxchildren($ar, $sth, $$cr[0], $depth);
+  }
+}
+
+sub nav2parent {
+ my ($t, $dist, $ar)=@_;
+ my $sth=$ds->prepare('select tax_id, parent_id, name, c_name from taxon where tax_id=?');
+ my $rt=$t; #target parent
+ my $st=$t;
+ while ($st && ($dist>0)) {
+   &sth_exec($sth, $st);
+   #fetch parent
+   undef($st);   
+   while ((my $r=sth_fetch($sth))) {
+     $st=$$r[1];
+     $rt=$$r[0];
+     push(@$ar, [@$r, $dist-1]) if $ar;
+     }
+   $dist--;
+   }
+ $sth->finish();
+ return $rt;
+}
+

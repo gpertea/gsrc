@@ -1,0 +1,190 @@
+#!/usr/bin/perl
+# this is just a library of several commonly used DBI/Sybase subroutines/wrappers
+use strict;
+use FindBin;use lib $FindBin::Bin;
+use POSIX qw(:termios_h);
+use dbSession;
+use Getopt::Std;
+umask(0077);
+my $usage=q{
+ Utility for Sybase database/server authentication file management. 
+ Unless otherwise specified with -f option, the current user authentication 
+ file ~/.db_pass is used.
+ 
+ Usage:
+ dbpass [-b <db>[@<SERVER>][/<servertype>]] 
+        [-s <SERVER>[/<servertype>][:<user>]]
+        [-f <auth_file>]
+
+ -b  update the list of databases for server <SERVER> by adding
+     database <db>, which can be a comma delimited list
+ -s  update/add user authentication for server <SERVER>
+     if <user> is not provided, the current Unix login name 
+     is assumed
+ -f  <auth_file> is used for update instead of 
+     ~/.db_pass
+};
+
+
+getopts('b:s:f:') || die $usage;
+
+my $d_server; #default Sybase server to use
+my $auth_section='Authentication';
+my $d_user=$ENV{'USER'};
+my $homedir=$ENV{'HOME'};
+my $authfile=$Getopt::Std::opt_f || $homedir.'/.db_pass';
+my $srv_op=$Getopt::Std::opt_b; #server/db operation request
+my $auth_op=$Getopt::Std::opt_s;#authentication operation request
+unless ($auth_op || $srv_op) {
+  print STDERR $usage;
+  exit(1);
+  }
+my $fcreate;
+unless (-e $authfile) {
+  print STDERR "Cannot locate authentication file ($authfile)\n. Creating new file.";  
+  $fcreate=1;
+  }
+#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=
+my $s_body;
+my $section;
+my (%sections, @sorder);
+unless ($fcreate) {
+   open (AUTHFILE, '<'.$authfile) || die "Cannot open file $authfile. Please create it first.\n";
+   $/="\n"; #Read one line at once, whole file
+   while (<AUTHFILE>) {
+   s/\s+$//;
+   next unless $_;
+   if (m/^\s*\[\s*(\S+)\s*\]/) {
+     $sections{$section}.=$s_body if $section;
+     $section=$1;
+     push(@sorder, $section) unless $section eq 'Authentication';
+     $s_body='';
+     }
+    else { #not a [section] title line
+      if ($section eq 'Default' && !$d_server) {
+           my $line=$_;
+           $line=~tr/ //d;           
+           my ($var, $value)=split(/=/);
+           $var=lc($var);
+           $d_server=$value if ($var eq 'server');
+           }
+     $s_body.=$_."\n";
+     }
+  }
+  $sections{$section}.=$s_body if $section;
+  close AUTHFILE;
+}
+#=======================
+my $msgbuf;
+my $do_update=1;
+if ($srv_op) { #database/server addition requested
+ my ($mydb,$mysrv);
+ if ($srv_op =~ m/^([\w\,]+)@(\w+)$/) {
+    ($mydb, $mysrv)=($1,$2);
+    }
+  else {
+   die "Error: no server given and no default server was found.\n"
+         unless $d_server;
+   ($mydb, $mysrv)=($srv_op, $d_server);
+   unless (&confirm("[Confirm:] Sure you want to add $mydb to server '$mysrv'?")) {
+          print STDERR "Operation cancelled\n"; 
+          exit(1);
+          }
+   }
+ local $_=0;
+ my @dbs=split(/,/, $mydb);
+ foreach my $mdb (@dbs) {
+   if ($_=$sections{$mysrv}) { #server entry already there
+    if (m/\b$mdb\b/m) { # db already there
+       print "Database $mdb already declared for server $mysrv\n";
+       $do_update=0;
+       }
+     else {  #add the db to this server's list (last line)
+       my ($lastline)=(m/\n?(.*?)\Z/m);       
+       my $repl=(length($lastline)+length($mdb)<78) ? ($lastline.', '.$mdb."\n") : ($lastline."\n".$mdb."\n");
+       s/$lastline\n/$repl/m;
+       $sections{$mysrv}=$_;
+       $msgbuf.="Database $mdb added to server $mysrv\n";
+       }
+    }
+  else {
+    $sections{$mysrv}=$mdb."\n";
+    push(@sorder, $mysrv);
+    $msgbuf.="Database $mdb added to server $mysrv\n";
+    }
+  }
+}
+
+if ($auth_op) { #authentication update requested:
+ $do_update=1;
+ my ($myuser, $mysrv);
+ if ($auth_op =~ m/^([\w\/]+):(\w+)$/) {
+    ($mysrv, $myuser)=($1,$2);
+    }
+  else { #user not provided, assuming default
+   ($mysrv, $myuser)=($auth_op, $d_user);
+   }
+ TYPEAGAIN:  
+ my $pass=&ask_pass("Enter password for user '$myuser' on server '$mysrv': ");
+ my ($srv, $stype)=split(/\//, $mysrv);
+ my $passck=&ask_pass("Please confirm this password by typing it again: ");
+ if ($pass ne $passck) {
+   print STDERR "No matching passwords. Please try again.\n";
+   goto TYPEAGAIN;
+   }
+ my $cryptpass =  scrypt($pass, $srv);
+ ##Debug only:
+ # my $decryptpass= sdecrypt($cryptpass, $srv);
+ # print STDERR "[[[[ DBG ]]]]>> password is: '$decryptpass' <<\n";
+ ##DBG^^
+ local $_=0;
+ if ($_=$sections{$auth_section}) { #Authentication section is there
+   #delete the line containing the given server and user, if any
+   s/[ \t]*$mysrv\s*\:\s*$myuser\/\S+\s*//m;
+   #add the new entry to the remaining
+   $_.="\n" unless m/\n\Z/m;
+   $_.="$mysrv:$myuser/$cryptpass\n";
+   $sections{$auth_section}=$_;
+   }
+ else {
+   $sections{$auth_section}="$mysrv:$myuser/$cryptpass\n";
+   }
+ $msgbuf.="Updated user '$myuser' credentials for server '$mysrv'.\n";
+ #
+}
+
+
+#=#=#=#=#= write to the file:
+#first, the default server:
+unless ($do_update) {
+ print "No update needed.\n";
+ exit(0)
+ }
+rename($authfile, $authfile.'..tmp');
+unless (open(WFILE, '>'.$authfile)) {
+  print STDERR "Error: cannot open file $authfile for write\nFile was not updated.\n";
+  rename($authfile.'..tmp', $authfile);
+  exit(1);
+  }
+#if (my $dbs=$sections{$d_server}) {
+# print WFILE "[$d_server]\n$dbs";
+# delete $sections{$d_server};
+# }
+my $auth_data=$sections{$auth_section};
+delete $sections{$auth_section};
+#scalar(keys(%sections)); #reset iterator
+foreach my $section (@sorder) {
+ my $sect_data=$sections{$section};
+ next unless $sect_data;
+ print WFILE "[$section]\n$sect_data\n";
+ }
+#finally, add the authentication data:
+print WFILE "[$auth_section]\n$auth_data\n";
+close WFILE;
+unlink($authfile.'..tmp');
+print $msgbuf;
+
+#==================================================
+sub prn {
+ print STDERR join("\n",@_),"\n";
+}

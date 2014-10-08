@@ -1,0 +1,90 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Std;
+use FindBin;use lib $FindBin::Bin;
+
+my $usage = q/
+Split a multi-fasta file in multiple smaller parts.
+Usage:
+ fasplit {-n <seqs_per_part> | -s <partsize>} [-o <outname>] <multifasta.fa>
+
+Options: 
+There are two modes of operation (mutually exclusive):
+ -n  split by number of sequences in a part
+ -s  split by part size; <partsize> is a numeric argument representing
+     the desired part size in Megabytes
+     
+ -o  specify the name prefix for the output files (parts);a 0-padded number 
+     and a .fa extension will be appended to <outname> for each part
+/;
+umask 0002;
+getopts('Nn:s:o:') || die($usage."\n");
+my $infile=$ARGV[0] || die("No multifasta input file provided!\n");
+my $outprefix=$Getopt::Std::opt_o;
+my $perSeq=$Getopt::Std::opt_N;
+unless ($outprefix) {
+ $outprefix=$infile;
+ $outprefix=~s/\.\w+$//;
+ }
+my $partsize=$Getopt::Std::opt_s;
+my $numseqs=$Getopt::Std::opt_n;
+die("$usage\nOnly one of -n or -s options can be given!\n")
+  if ($numseqs && $partsize);
+if ($perSeq) { $numseqs=1; $partsize=''; } 
+my $bufProcess = $numseqs ? \&nBufProc : \&sBufProc;
+open(INFILE, $infile) || die("Input file $infile cannot be opened!");
+$partsize=int($partsize*1024*1024);
+#my $rsize=0; #accumulated read size so far since the last file open
+my $rsize=0;
+my $wsize=0; #last written size
+#my $partbuf;
+my $scount=1;
+my $partnum=1; #current part number
+my $pfname=sprintf('%s%02d',$outprefix,$partnum).'.fa';
+open(PFNAME, '>'.$pfname) || die ("Error creating file $pfname!\n");
+while (<INFILE>) {
+ tr/\n\r//d;
+ next unless $_;
+ if (m/^>/) {
+   #starting record:
+   #print STDERR "* starting record: $_\n";
+   &$bufProcess();
+   }
+ $rsize+=length($_)+1;
+ print PFNAME $_."\n";
+ 
+}
+close(INFILE);
+#&$bufProcess(1);
+close(PFNAME);
+
+sub nBufProc {
+ return unless $rsize>0;
+ if ($scount>=$numseqs) {
+   close(PFNAME);
+   $partnum++;
+   $pfname=sprintf('%s%02d',$outprefix,$partnum).'.fa';
+   #print STDERR "$scount > $numseqs  : write to $pfname now.\n";
+   open(PFNAME, '>'.$pfname) || die ("Error creating file $pfname!\n");   
+   $wsize=$rsize;
+   $rsize=0;
+   $scount=0;
+   }
+ $scount++;
+}
+
+sub sBufProc {
+ return unless $rsize>0;
+ if ($rsize>=$partsize) {
+   #close previous part, open new one
+   close(PFNAME);
+   $partnum++;
+   $pfname=sprintf('%s%02d',$outprefix,$partnum).'.fa';
+   open(PFNAME, '>'.$pfname) || die ("Error creating file $pfname!\n");
+   $wsize=$rsize;
+   $rsize=0;
+   $scount=0;
+   }
+ $scount++;
+}
+
