@@ -1,0 +1,96 @@
+# Useful directories
+# the path to Geo's C++ utility library source code
+GCD := ../gclib
+
+#this must be the paths to FOX install prefix directory 
+# ( with the ./include/fox-1.6 and ./lib subdirectories )
+
+CC     :=
+LINKER :=
+ifdef MINGW_HOME
+  ifdef MINGW_CC
+   CC := $(MINGW_CC)
+  else
+   CC=$(MINGW_HOME)/bin/g++.exe
+  endif
+  ifdef MINGW_LINKER
+   LINKER := $(MINGW_LINKER)
+  else
+   LINKER := $(CC)
+  endif
+else
+# CC      := g++
+# LINKER  := g++
+ CC      := /usr/bin/i686-w64-mingw32-g++
+ LINKER  := /usr/bin/i686-w64-mingw32-g++
+endif
+
+FOXPREFIX = /opt/mingw
+# -- doing this from Cygwin
+
+# -- modify this too if the FOX include files are somewhere else
+FOXINCDIR := ${FOXPREFIX}/include/fox-1.7
+FOXLIBDIR := ${FOXPREFIX}/lib
+FOXLIB := ${FOXLIBDIR}/libFOX-1.7.a
+
+LDFLAGS  := -flto -static-libgcc -static-libstdc++ 
+LIBS     := -lwsock32 -limm32
+#FOX is linking all these: -lcomctl32 -lwsock32 -lwinspool -lmpr -lgdi32 -limm32 -lpthread -lopengl32 -lglu32
+RESWRAP  := ${FOXPREFIX}/bin/reswrap.exe 
+
+# Directories to search for header files
+INCDIRS := -I. -I${GCD} -I${FOXINCDIR}
+
+
+CXXFLAGS  = -Wall -Wextra -Wformat -Woverloaded-virtual -Wshadow -O2 -Wuninitialized \
+ -ffast-math -fstrict-aliasing -finline-functions -fomit-frame-pointer -fexpensive-optimizations 
+#DEFINES   = -DFOX_BIGENDIAN=0 -D_WINDOWS -DDEBUG -D_DEBUG -DWIN32 -D_WIN32 -DMINGW -DMINGW32 
+DEFINES = -DNO_XIM
+
+# C++ compiler
+RM := rm -f
+%.o : %.cpp
+	${CC} $(INCDIRS) -c $< -o $@ $(CXXFLAGS) $(DEFINES)
+
+OBJS = ./appmain.o ./mdichild.o ./clrutils.o ${GCD}/GBase.o ${GCD}/LayoutParser.o ${GCD}/AceParser.o ./mainwin.o ./FXClView.o
+
+ICONS  =   adie_gif.gif
+ICONS +=   big_gif.gif
+ICONS +=   bookdel_gif.gif
+ICONS +=   booknext_gif.gif 
+
+.PHONY : all
+clview: clview.exe
+all:   clview.exe
+debug: all
+static: all
+
+clrutils.o : clrutils.h
+mdichild.o : clv_icons.h mdichild.h FXClView.h
+FXClView.o : FXClView.h
+mainwin.o  : mainwin.h
+
+# -- to generate cpp files from gifs :
+#icons.h: $(ICONS)
+#	$(RESWRAP) -i -o icons.h $(ICONS)
+#
+#icons.cpp: $(ICONS)
+#	$(RESWRAP) -e -o icons.cpp $(ICONS)
+ 
+
+clview.exe: ${OBJS} $(FOXLIB)
+	$(LINKER) -fwhole-program -s -mwindows $(LDFLAGS) $(DEFINES) -o $@ $(OBJS) $(FOXLIB) $(LIBS)
+	strip $@
+
+#clview : $(OBJS)
+#	${LINKER} ${LDFLAGS} -o $@ ${filter-out %.a %.so, $^} ${LIBS}
+
+
+# target for removing all object files
+
+.PHONY : clean
+clean:: 
+	${RM} clview core* *.exe ${OBJS}
+
+
+

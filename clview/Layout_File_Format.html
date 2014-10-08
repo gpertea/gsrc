@@ -1,0 +1,344 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html><head>
+  
+  
+  
+  <meta content="text/html; charset=ISO-8859-1" http-equiv="content-type"><title>Layout File Format</title></head>
+<body>
+<h3>Layout file format specification (proposal)<br>
+</h3>
+
+
+
+
+<b><br>
+</b>Besides the usual ACE files, <b>clview </b>also recognizes a proprietary "layout" format (stored in file usually having the extension <tt>.lyt</tt>)
+for representing multiple sequence alignment (MSA) layouts -- where
+typically smaller "component"sequences (henceforth called "<b>reads</b>") are aligned to (or are making up) a larger sequence (henceforth called "the <b>contig</b>").<br>
+
+
+
+
+<br>
+
+
+
+
+These layout files are text files having a pseudo-FASTA format-- each
+FASTA record representing one contig's "layout", like this:<br>
+
+
+
+
+<br>
+
+
+
+
+<big><b>&gt;</b></big><i><small>&lt;</small>contigName<small>&gt;</small></i> <small>&lt;</small><i>number_of_reads<small>&gt;</small> </i><small>&lt;</small><i>contig_start_coord<small>&gt;</small> </i><small>&lt;</small><i>contig_end_coord<small>&gt;</small> [&lt;sequence&gt;</i><i>]<br>
+</i><i><small>&lt;</small>readName<small>&gt;</small></i> <small>&lt;</small><i>orientation<small>&gt;</small> </i><small>&lt;</small><i>read_length<small>&gt;</small> </i><small>&lt;</small><i>read_start_coord<small>&gt;</small></i> <small>&lt;</small><i>clip_left<small>&gt; </small></i><small>&lt;</small><i>clip_right<small>&gt; </small></i><i>[ &lt;extra_attributes...&gt;</i><i>]</i><i><br>
+</i>.<br>
+
+
+
+
+.<br>
+
+
+
+
+All the fields on every line are space delimited (tab or plain space). Therefore no spaces are allowed <i>within</i> the fields (so contig and read names are not allowed to contain spaces).<br>
+
+
+
+
+Each FASTA-like record in such multi-layout file represents one layout
+definition (a multiple alignment space). Every such layout definition
+must start with line beginning with the '<b>&gt;</b>' character and
+containing some general contig/layout data (contig name, number of
+component reads, the start/end coordinates for the layout space and
+optionally the actual contig sequence, if any). This first
+contig/layout general info line must be followed by exactly <small>&lt;</small><i>number_of_reads<small>&gt;</small></i> lines containing component/read information (one line per read). For each <i>read</i> line , that fields are as follows:<br>
+
+
+
+
+<table bgcolor="#ccccff" border="0" cellpadding="2" cellspacing="2" width="100%">
+
+
+
+
+  <tbody>
+    <tr>
+      <td bgcolor="#ffffff" valign="top">1.<br>
+      </td>
+      <td bgcolor="#ffffff" valign="top"><i><small>&lt;</small>readName<small>&gt;</small></i></td>
+      <td bgcolor="#ffffff" valign="top">a sequence identifier, unique within the current contig/layout</td>
+    </tr>
+    <tr>
+      <td bgcolor="#ffffff" valign="top">2.<br>
+      </td>
+      <td bgcolor="#ffffff" valign="top"><small>&lt;</small><i>orientation<small>&gt;</small> </i></td>
+      <td bgcolor="#ffffff" valign="top">one character: '+' or '-', representing the forward or reverse orientation of the read in the current layout<br>
+      </td>
+    </tr>
+    <tr>
+      <td bgcolor="#ffffff" valign="top">3.<br>
+      </td>
+      <td bgcolor="#ffffff" valign="top"><small>&lt;</small><i>read_length<small>&gt;</small> </i></td>
+      <td bgcolor="#ffffff" valign="top">the actual length of the read (including the clipped ends).&nbsp; If segmented (see the <b>G:</b> option of <i>&lt;extra_attributes&gt;</i>), the intra-segment gaps are not considered as part of read length in the layout. <br>
+      </td>
+    </tr>
+    <tr>
+      <td bgcolor="#ffffff" valign="top">4.<br>
+      </td>
+      <td bgcolor="#ffffff" valign="top"><small>&lt;</small><i>read_start_coord<small>&gt;</small></i></td>
+      <td bgcolor="#ffffff" valign="top">the leftmost (lowest) coordinate of this read in the current layout (contig). The position could be
+"virtual" if the read is clipped at that left end; so this value can be obtained by subtracting <small>&lt;</small><i>clip_left</i><small>&gt; </small> value
+from the layout coordinate of the start of the alignment. Therefore it does not depend on the orientation of the read.<br>
+      </td>
+    </tr>
+    <tr>
+      <td bgcolor="#ffffff" valign="top">5.<br>
+      </td>
+      <td bgcolor="#ffffff" valign="top"><small>&lt;</small><i>clip_left</i><small>&gt; </small></td>
+      <td bgcolor="#ffffff" valign="top">the number of nucleotides trimmed at the left end of the alignment (read orientation does not matter)<br>
+      </td>
+    </tr>
+    <tr>
+      <td bgcolor="#ffffff" valign="top">6.<br>
+      </td>
+      <td bgcolor="#ffffff" valign="top"><i><small> </small></i><small>&lt;</small><i>clip_right<small>&gt; </small></i></td>
+      <td bgcolor="#ffffff" valign="top">the number of nucleotides trimmed at the right end of this read.<br>
+ </td>
+    </tr>
+    <tr>
+      <td bgcolor="#ffffff" valign="top">7.-...<br>
+      </td>
+      <td bgcolor="#ffffff" valign="top"><i>[&lt;extra_attributes...&gt;]</i></td>
+      <td bgcolor="#ffffff" valign="top">One ore more space delimited<i> optional</i>
+attributes for this read may follow. Their order is not enforced and
+they should all start with a letter code followed by the ':' character
+and then followed by attribute specific text data (spaces not allowed).
+General format is:&nbsp; <small>&lt;</small><i>attr_code<small>&gt;</small></i><small><big><b>:</b></big></small><small>&lt;</small><i>attr_data<small>&gt;<br>
+      <br>
+</small></i>Attributes recognized by the current specification:<br>
+      <table bgcolor="#cccccc" border="0" cellpadding="4" cellspacing="3" width="100%">
+        <tbody>
+          <tr>
+            <td bgcolor="#ffffff" valign="top"><b>C:</b><small>&lt;</small><i>grp#<small>&gt;</small></i></td>
+            <td bgcolor="#ffffff" valign="top">group color for the current read. This instructs the viewer to 
+            draw this read with a specific color uniquely associated to the given <small>&lt;</small><i>grp#<small>&gt;</small>
+            </td>
+          </tr>
+          <tr>
+            <td bgcolor="#ffffff" valign="top"><b>L:</b><small>&lt;</small><i>other_readName<small>,..&gt;</small></i></td>
+            <td bgcolor="#ffffff" valign="top">[clone] link to another
+read in the layout. This instructs the viewer to place the other read
+on the same vertical line in the layout display (if possible), with
+perhaps a dotted line connecting such reads; a comma delimited list of
+read names can be given if such links extend to more than one other
+read. Only one read in such a linked list&nbsp; needs to have such a L:
+entry in order to declare the linked list/group of reads (that is, the
+other linked reads do not need to reciprocate by having the
+corresponding, but redundant L: attribute).<br>
+            </td>
+          </tr>
+          <tr>
+            <td bgcolor="#ffffff" valign="top"><b>S:</b><small>&lt;</small><i>sequence<small>&gt;</small></i></td>
+            <td bgcolor="#ffffff" valign="top">The nucleotide sequence
+of the read exactly as it is included in the alignment. It must include
+the clipped ends and the small gaps (indels) introduced by the MSA
+(represented as '-' or '*' in the<small> &lt;</small><i>sequence<small>&gt;</small></i>)  -- so the length of such <small>&lt;</small><i>sequence<small>&gt;</small></i> string must be equal to <small>&lt;</small><i>read_length<small>&gt;</small> </i></td>
+          </tr>
+          <tr>
+            <td bgcolor="#ffffff" valign="top"><b>G:</b><small>&lt;</small><i>seg1_end[</i><big><tt><b>c</b></tt></big><i><small>&lt;</small>seq1clipright<small>&gt;</small>]</i><i>[</i><big><tt><b>s</b><i>|</i><b>S</b></tt></big><i><small></small>]</i><tt><b>-</b></tt><i><br>
+&nbsp;seg2_start</i><i>[</i><big><tt><b>c</b></tt></big><i><small>&lt;</small>seg2clipleft<small>&gt;</small>]</i><i>[</i><big><tt><b>s</b><i>|</i><b>S</b></tt></big><i>]</i><b>,</b><i>...&gt;</i></td>
+            <td bgcolor="#ffffff" valign="top">Segmented alignment
+(e.g. EST to genome). This is an indication that the read contains
+large internal gaps -- which should be displayed as <i>segments</i>
+connected by lines. The data for this attribute consists of a comma
+delimited list of coordinate pairs for the inter-segment gaps.
+Coordinates in a pair are separated by the '-' character. For each pair
+the first coordinate is the <i>end</i> position in the layout of the <i>previous</i> segment, while the second coordinate is the <i>start</i> position of the <i>next </i>segment in the layout.<br>
+            <br>
+Example: say we have a "read" (e.g. a mRNA) called "MRNA244" which
+aligns onto the "contig" (e.g. genomic sequence) of length 34000 as 3
+distinct segments (e.g. 3 exons), aligned at genomic coordinates: 300
+to 500 (first segment), 800 to 1100 (second segment) and 1500 to 1900
+(third segment) respectively. Assuming there is a 30nt clipping at the
+left end and 20nt clipping at the right end, and that the alignment has
+a "forward" orientation, the contig and the sequence line for MRNA244
+in the layout file would look like this (let's assume there are 281
+"reads" total in this imagined layout):<br>
+            <br>
+            <tt>&gt;contig1 281 1 34000<br>
+MRNA244 + 953 270 30 20 G:500-800,1100-1500<br>
+            </tt><br>
+The actual length of the "read" accounts for the length of each segment
+(201, 301 and 401 respectively) plus the clipping lengths at each end
+(20 and 30), so the total is 201+301+401+20+30=953<br>
+The left coordinate of the sequence in the alignment (270) is equal to
+the position of the first (leftmost) segment (300) minus the left-end
+clipping (30). <br>
+            <br>
+There is a possibility to have clipping for each segment. This can be
+specified for each segment's end by appending the character <big><b><tt>c</tt></b></big>
+followed by the amount of clipping at that end. If in the example
+segment alignment above we had the 1st exon clipped 10 nucleotides at
+the right end, the 2nd exon clipped 5nt at the left end and 7nt at the
+right end, with the 3rd exon having 9nt clipped at the left end, the
+above read line may look like this:<br>
+            <br>
+            <tt>
+MRNA244 + 953 270 30 20 G:490c10-805c5,1093c7-1509c9<br>
+            </tt><br>
+Please note that in this last example the actual coordinates of the
+alignment of the 3 segments (exons) to the genomic sequence are
+300-490, 805-1093 and 1509-1900 respectively. The way the clipping is
+specified in this G: attribute differs from the way the leftmost and
+rightmost clipping of the whole read is given. The difference is that
+the <big><b><tt>c</tt></b></big>
+clipping lengths in the G: attribute lie OUTSIDE the coordinates given
+for the segment ends in the same G: attibute, while the global leftmost
+clipping (30 in the example above) is included in the offset coordinate
+for the whole read (270 here).<br>
+            <br>
+For EST to genome alignments, an optional 'S' (or 's') character may
+follow the inter-segment ends, indicating that a splice consensus
+(major or minor, respectively) was found on that side of the intron
+corresponding to that inter-segment gap.<br>
+&nbsp;<br>
+            </td>
+          </tr>
+          <tr>
+            <td bgcolor="#ffffff" valign="top"><b>D:</b><small>&lt;</small><i>se</i><i>q_diffs<small>..&gt;<br>
+</small></i>&nbsp;or for segmented (G:)&nbsp; reads:<i><small><br>
+            </small></i><b>D:</b><small>&lt;</small><i>se</i><i>g1_diffs<small>..&gt;</small></i><big><b>/</b></big><small>&lt;</small><i>se</i><i>g2_diffs<small>..&gt;</small></i><i><small><br>
+<br>
+            </small></i><br>
+</td>
+            <td bgcolor="#ffffff" valign="top">If the contig sequence is given, this read attribute is the way to provide the display application with only a list of point-<i>differences</i> between this read's sequence and the contig sequence (so S: is not be needed).&nbsp; The <small>&lt;</small><i>seq_diffs<small>&gt;</small></i> is a concatenation of elements of this format:<br>
+            <small>&lt;</small><i>incremental_coordinate<small>&gt;</small></i><small>&lt;</small><i>character<small>&gt;</small></i><i><br>
+            <br>
+            </i>..where <small>&lt;</small><i>incremental_coordinate<small>&gt;</small></i> is the numeric position of such a difference <i>relative </i>to
+the previous difference -- or&nbsp; if no such previous difference exists, relative to
+the first (leftmost) non-clipped nucleotide of the read. This incremental
+coordinate (which is always at least 1) must be followed by a <small>&lt;</small><i>character<small>&gt;</small></i>
+code. This character can be either an actual DNA base letter ('A', 'G', 'C', 'T', 'N', etc.) -- which
+indicates a nucleotide mismatch at that position, or the "dash"
+character ('-') indicating a gap in the alignment or this read to the
+contig sequence. <br>
+            <br>
+Example: the following alignment is there between contig sequence and the read sequence:<br>
+            <br>
+            <tt>contig:&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; ..A G T T G C T - C C T A - C T A C A G A C C N G...<br>
+read: &nbsp; &nbsp; &nbsp;&nbsp; ..A G T <font color="#990000">-</font> <font color="#990000">C</font> C T <font color="#990000">T</font> C C <font color="#990000">A</font> A <font color="#990000">N</font> C T <font color="#990000">- -</font> A <font color="#990000">T</font> A C C <font color="#990000">A</font> G...<br>
+(increments:&nbsp;&nbsp; &nbsp; &nbsp; &nbsp; 4 1&nbsp; &nbsp;&nbsp; 3
+&nbsp;&nbsp;&nbsp; 3 &nbsp; 2&nbsp;&nbsp;&nbsp;&nbsp; 3 1 &nbsp; 2
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; 4&nbsp; ... )<br>
+            </tt><br>
+Assuming that the above alignment starts at position 200 in the contig
+and that the read called RDAAA of length 620 has 20 bp clipping right
+before this alignment (so the read left end coordinate in the layout is
+181), the following line description would apply to this read in the
+layout file (the ending ellipsis ... is not part of the actual text but
+just e placeholder for possible other differences to report):<br>
+            <br>
+            <tt>RDAAA + 620 181 20 0 D:4-1C3T3A2N3-1-2T4A...<br>
+            </tt><br>
+Note that in this compact MSA representation there is no information
+provided about the nucleotide content of the clipped ends of the read.
+The viewer application may choose to represent such clipped regions as
+empty or gray boxes (rectangles), with the actual nucleotides only
+displayed in the non-clipped regions.<br>
+            <br>
+For segmented alignments (i.e. those reads having a <b>G:</b>
+attribute), multiple such lists should be given (one for each segment),
+separated by the '/' (slash) character. For each such
+segment-differences list, the first incremental coordinate will be the
+distance from the beginning of the first (leftmost) non-clipped
+nucleotide of that segment.<br>
+            <br>
+            </td>
+          </tr><tr>
+            <td bgcolor="#ffffff" valign="top"><b>I:</b><small>&lt;</small><i>se</i><i>q_indels<small>..&gt;<br>
+</small></i>or for segmented (G:)&nbsp; reads:<i><small><br>
+            </small></i><b>I:</b><small>&lt;</small><i>se</i><i>g1_indels<small>..&gt;</small></i><big><b>/</b></big><small>&lt;</small><i>se</i><i>g2_indels<small>..&gt;</small></i><br>
+            </td>
+            <td bgcolor="#ffffff" valign="top">Similar to the D: attribute, only that the <i>original</i>
+sequence for the read is assumed known from other sources (e.g. an
+indexed multi-FASTA file) and only gaps and deletions are reported as
+the operations needed to make that sequence fit into the current MSA. <br>
+The coordonate system is now entirely based on the <i>original</i>, raw
+read sequence, but with the same adjustment of the start coordinate
+based on the left clipping (i.e. all coordinates are relative to the
+first (leftmost) base in the read that is not clipped but actually used
+in the MSA).<br>
+The <small>&lt;</small><i>seq_indels<small>&gt;</small></i> is a concatenation of elements of this format:<br>
+            <br>
+
+            <small>&lt;</small><i>incremental_coordinate<small>&gt;</small></i><small>&lt;</small><i>indel_char<small>&gt;</small></i> <br>
+            <br>
+..where&nbsp; <small>&lt;</small><i>indel_char<small>&gt;&nbsp; </small></i>can
+be either '-' (gap) or 'd' (deletion)&nbsp; at the specific base
+position in the original read sequence. The actual base position can be
+obtained by this iterative formula:<br>
+            <br>
+            <i>&lt;base_position&gt;</i>&nbsp; =&nbsp; <i>&lt;incremental_coordinate&gt;</i> + <i>&lt;prev_base_position&gt;</i><br>
+            <br>
+..where <i>&lt;prev_base_position&gt;</i> = <i>&lt;clip_left&gt;</i> for the first iteration (first element of&nbsp; <i>&lt;seq_indels&gt;</i>)<br>
+            <br>
+            <i><small></small></i></td>
+          </tr>
+<tr>
+            <td bgcolor="#ffffff" valign="top"><b>R:</b><i><small>&lt;</small>gaplist<small>&gt;</small></i><b><big>/</big></b><i><small>&lt;</small>contig_gaplist<small>&gt;</small></i><br>
+            </td>
+            <td bgcolor="#ffffff" valign="top">a special attribute for
+the Assembly-on-Reference procedure, providing all gap information for
+the alignment of this read to the parent contig. The gapping
+information (as produced by mgblast with -D5 option) is stored directly
+in this attribute data: the gaps in the read are in the first list <i><small>&lt;</small>gaplist<small>&gt;</small></i> and the gaps in the contig (reference) sequence are stored in <i><small>&lt;</small>contig_gaplist<small>&gt;</small></i>. The two lists are separated by the '/' (slash) character. Just like
+mgblast's -D5 output, the gap list has the format:<br>
+            <br>
+            <i><small>&lt;</small>gap1pos<small>&gt;</small>[+<small>&lt;</small>gap1length<small>&gt;</small>]</i><b>,</b><i><small>&lt;</small>gap2pos<small>&gt;</small>[+<small>&lt;</small>gap2length<small>&gt;</small>],...</i><br>
+            <br>The <i>nrcl</i>
+(non-redundandification clustering) program automatically writes this
+attribute in the layout file produced when the -y option is given (if
+the gap information is available in the parsed mgblast hits).<br>
+            <br>
+The <i>mblaor</i> (mgblast assembly-on-reference) program requires this
+attribute to be present when parsing an input layout file in order to
+generate a full MSA, transforming this info into indel operations
+applied to the read.<br>
+
+            </td>
+          </tr>
+
+        </tbody>
+      </table>
+      <br>
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+
+
+
+<br>
+
+
+
+
+<br>
+
+
+
+
+<br>
+
+
+
+
+</body></html>
